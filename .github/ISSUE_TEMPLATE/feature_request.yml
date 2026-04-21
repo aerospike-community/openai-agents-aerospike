@@ -1,0 +1,28 @@
+name: Feature request
+description: Suggest a new capability, an API change, or an improvement.
+title: "[feature] "
+labels: ["enhancement"]
+body:
+  - type: textarea
+    id: motivation
+    attributes:
+      label: Motivation
+      description: What problem are you trying to solve? Include user-visible symptoms if this is a usability issue.
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed change
+      description: What would you like the API, data model, or behavior to look like?
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other designs or workarounds you've thought about.
+  - type: textarea
+    id: additional-context
+    attributes:
+      label: Additional context

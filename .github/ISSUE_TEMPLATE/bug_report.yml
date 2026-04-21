@@ -1,0 +1,60 @@
+name: Bug report
+description: Report unexpected behavior, crashes, or incorrect results.
+title: "[bug] "
+labels: ["bug"]
+body:
+  - type: textarea
+    id: summary
+    attributes:
+      label: Summary
+      description: What happened?
+    validations:
+      required: true
+  - type: textarea
+    id: reproduction
+    attributes:
+      label: Reproduction
+      description: Minimal code snippet, including the `AerospikeSession` construction and the failing call.
+      render: python
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behavior
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual behavior / error output
+      description: Include the full traceback if any.
+      render: text
+  - type: input
+    id: package-version
+    attributes:
+      label: openai-agents-aerospike version
+      placeholder: e.g. 0.1.0
+    validations:
+      required: true
+  - type: input
+    id: sdk-version
+    attributes:
+      label: openai-agents version
+      placeholder: e.g. 0.14.0
+    validations:
+      required: true
+  - type: input
+    id: aerospike-version
+    attributes:
+      label: Aerospike server version
+      placeholder: e.g. 7.2.0.4 CE
+    validations:
+      required: true
+  - type: input
+    id: python-version
+    attributes:
+      label: Python version
+      placeholder: e.g. 3.11.9
+    validations:
+      required: true

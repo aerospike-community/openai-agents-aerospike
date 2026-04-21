@@ -1,0 +1,77 @@
+name: CI
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+jobs:
+  lint:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+      - name: Install dev deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install "ruff==0.9.2" mypy
+          pip install -e .
+      - name: Ruff format check
+        run: ruff format --check .
+      - name: Ruff lint
+        run: ruff check .
+      - name: Mypy
+        run: mypy src/openai_agents_aerospike
+
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python-version: ["3.10", "3.11", "3.12"]
+
+    services:
+      aerospike:
+        image: aerospike/aerospike-server:latest
+        ports:
+          - 3000:3000
+          - 3001:3001
+          - 3002:3002
+        options: >-
+          --health-cmd "asinfo -v build || exit 1"
+          --health-interval 5s
+          --health-timeout 5s
+          --health-retries 12
+
+    env:
+      AEROSPIKE_HOST: 127.0.0.1
+      AEROSPIKE_PORT: "3000"
+      AEROSPIKE_NAMESPACE: test
+
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python-version }}
+
+      - name: Install package + test deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -e .
+          pip install pytest pytest-asyncio pytest-cov
+
+      - name: Wait for Aerospike
+        run: |
+          for i in $(seq 1 30); do
+            python -c "import aerospike; c=aerospike.client({'hosts':[('127.0.0.1',3000)]}).connect(); c.close()" && exit 0
+            echo "Waiting for Aerospike... ($i)"
+            sleep 2
+          done
+          echo "Aerospike did not become ready" >&2
+          exit 1
+
+      - name: Run tests
+        run: pytest -v --cov=openai_agents_aerospike --cov-report=term-missing

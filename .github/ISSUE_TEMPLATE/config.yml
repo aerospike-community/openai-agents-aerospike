@@ -1,0 +1,8 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Security vulnerability
+    url: https://github.com/aerospike-community/openai-agents-aerospike/security/advisories/new
+    about: Please report security issues privately via a GitHub security advisory.
+  - name: Question or discussion
+    url: https://github.com/aerospike-community/openai-agents-aerospike/discussions
+    about: For usage questions and open-ended discussion, prefer Discussions over Issues.
