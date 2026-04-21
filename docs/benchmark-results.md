@@ -49,15 +49,15 @@ Phase 2 to land higher but still low-single-digit milliseconds at p50.
 
 | history depth | op | p50 (ms) | p95 (ms) | p99 (ms) | mean (ms) |
 |---:|---|---:|---:|---:|---:|
-| 0 | `get_items(limit=20)` | 0.292 | 0.444 | 1.066 | 0.322 |
-| 0 | `add_items(2)` | 0.318 | 0.525 | 1.295 | 0.367 |
-| 0 | **turn** | **0.614** | 0.954 | 2.987 | 0.689 |
-| 50 | `get_items(limit=20)` | 0.260 | 0.469 | 1.844 | 0.321 |
-| 50 | `add_items(2)` | 0.290 | 0.618 | 2.485 | 0.361 |
-| 50 | **turn** | **0.553** | 1.096 | 3.844 | 0.682 |
-| 200 | `get_items(limit=20)` | 0.276 | 0.565 | 2.040 | 0.340 |
-| 200 | `add_items(2)` | 0.319 | 0.919 | 3.277 | 0.425 |
-| 200 | **turn** | **0.595** | 1.486 | 4.926 | 0.764 |
+| 0 | `get_items(limit=20)` | 0.258 | 0.455 | 1.429 | 0.312 |
+| 0 | `add_items(2)` | 0.273 | 0.572 | 1.372 | 0.335 |
+| 0 | **turn** | **0.527** | 1.014 | 2.389 | 0.648 |
+| 50 | `get_items(limit=20)` | 0.235 | 0.497 | 1.406 | 0.289 |
+| 50 | `add_items(2)` | 0.257 | 0.671 | 2.111 | 0.329 |
+| 50 | **turn** | **0.492** | 1.043 | 3.323 | 0.618 |
+| 200 | `get_items(limit=20)` | 0.264 | 0.648 | 1.736 | 0.332 |
+| 200 | `add_items(2)` | 0.292 | 0.768 | 1.948 | 0.375 |
+| 200 | **turn** | **0.562** | 1.540 | 3.785 | 0.706 |
 
 Depth 1,000 is infeasible for this backend at the default item sizes
 because 2,000 total items × ~1.5 KiB ≈ 3 MiB exceeds the 1 MiB
@@ -68,38 +68,38 @@ for long-running sessions.
 
 | history depth | op | p50 (ms) | p95 (ms) | p99 (ms) | mean (ms) |
 |---:|---|---:|---:|---:|---:|
-| 0 | `get_items(limit=20)` | 0.306 | 0.567 | 1.779 | 0.370 |
-| 0 | `add_items(2)` | 0.333 | 0.661 | 2.386 | 0.390 |
-| 0 | **turn** | **0.640** | 1.232 | 4.483 | 0.761 |
-| 50 | `get_items(limit=20)` | 0.302 | 0.506 | 1.526 | 0.354 |
-| 50 | `add_items(2)` | 0.321 | 0.599 | 1.558 | 0.377 |
-| 50 | **turn** | **0.623** | 1.110 | 3.375 | 0.732 |
-| 200 | `get_items(limit=20)` | 0.330 | 0.651 | 2.256 | 0.407 |
-| 200 | `add_items(2)` | 0.368 | 0.745 | 2.160 | 0.432 |
-| 200 | **turn** | **0.709** | 1.375 | 4.344 | 0.839 |
-| 1000 | `get_items(limit=20)` | 1.519 | 2.712 | 4.418 | 1.584 |
-| 1000 | `add_items(2)` | 0.630 | 1.277 | 2.138 | 0.739 |
-| 1000 | **turn** | **2.125** | 3.934 | 5.917 | 2.322 |
+| 0 | `get_items(limit=20)` | 0.280 | 0.421 | 1.653 | 0.321 |
+| 0 | `add_items(2)` | 0.298 | 0.484 | 1.579 | 0.341 |
+| 0 | **turn** | **0.585** | 0.903 | 3.190 | 0.662 |
+| 50 | `get_items(limit=20)` | 0.286 | 0.466 | 1.512 | 0.330 |
+| 50 | `add_items(2)` | 0.297 | 0.582 | 1.502 | 0.350 |
+| 50 | **turn** | **0.583** | 1.032 | 2.711 | 0.680 |
+| 200 | `get_items(limit=20)` | 0.288 | 0.638 | 1.595 | 0.348 |
+| 200 | `add_items(2)` | 0.318 | 0.658 | 1.817 | 0.395 |
+| 200 | **turn** | **0.605** | 1.368 | 3.275 | 0.743 |
+| 1000 | `get_items(limit=20)` | 0.322 | 0.584 | 1.625 | 0.388 |
+| 1000 | `add_items(2)` | 0.416 | 0.851 | 2.600 | 0.506 |
+| 1000 | **turn** | **0.752** | 1.544 | 3.924 | 0.893 |
 
 ## Observations
 
-- **Sub-millisecond turns.** At practical history depths (up to ~200
-  items), both backends deliver p50 agent turn latency well under one
-  millisecond on this machine.
-- **Sharding overhead is small at low depth.** `ShardedAerospikeSession`
+- **Sub-millisecond turns at every measured depth.** Both backends
+  deliver p50 agent turn latency well under one millisecond on this
+  machine, including the sharded backend at depth 1,000 where the
+  non-sharded variant is infeasible.
+- **Sharded overhead is in the noise at low depth.** `ShardedAerospikeSession`
   costs roughly 50-100 μs of p50 turn latency over the non-sharded
-  variant, reflecting the extra shard-0 read for the `active_shard`
-  pointer. p95 / p99 tails are similar.
-- **Sharding scales where the non-sharded variant cannot.** At depth
-  1,000 (roughly 1.5 MiB of conversation after warmup), the non-sharded
-  `AerospikeSession` is simply infeasible; the sharded variant keeps p50
-  turns at ~2.1 ms and p99 under 6 ms. `get_items(limit=20)` is the
-  dominant cost at that depth because today it performs a `batch_read`
-  across every shard and then concatenates. Reading only the latest
-  shards when `limit` is small is the most obvious Phase 2 optimization.
-- **Add-path is flat.** `add_items(2)` times are essentially independent
-  of history depth for both backends because the server-side `operate`
-  list-append op is O(1) in the existing list size.
+  variant — the price of the extra shard-0 read for the `active_shard`
+  pointer — and the gap barely widens as depth grows.
+- **Sharded reads are flat across depth.** Because `get_items(limit=N)`
+  walks shards from the tail using `list_get_range(bin, -need, need)`,
+  it pays for at most two round trips when the active shard's tail
+  holds enough items (the common case), regardless of how many shards a
+  long-running session has accumulated. At depth 1,000 the read p50 is
+  0.322 ms, within 25% of the depth-0 read.
+- **Add-path is flat with depth.** `add_items(2)` times are essentially
+  independent of history depth for both backends because the server-side
+  `operate` list-append op is O(1) in the existing list size.
 
 ## Caveats for these numbers
 

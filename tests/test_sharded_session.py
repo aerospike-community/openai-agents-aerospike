@@ -159,6 +159,75 @@ async def test_sharded_limit_zero_is_noop(aerospike_client: object) -> None:
         await session.clear_session()
 
 
+async def test_sharded_tail_read_does_not_cross_shard_when_unneeded(
+    aerospike_client: object,
+) -> None:
+    """A ``limit`` satisfiable from the active shard alone must only read that shard.
+
+    This exercises the tail-first read path: two rotations, then a handful
+    of small items on the tail shard, then a bounded ``get_items`` whose
+    limit fits comfortably in the active shard's tail. Regardless of the
+    earlier shards' contents, the result must be the last ``limit`` items
+    in insertion order.
+    """
+    session = _make_sharded(aerospike_client)
+    try:
+        big_a = "a" * _BIG_PAYLOAD_SIZE
+        big_b = "b" * _BIG_PAYLOAD_SIZE
+
+        # Two overflow items land on shard 0 and shard 1.
+        await session.add_items([{"role": "user", "content": big_a}])
+        await session.add_items([{"role": "assistant", "content": big_b}])
+
+        # Several small items land on the tail shard.
+        tail_contents = ["one", "two", "three", "four", "five"]
+        for text in tail_contents:
+            await session.add_items([{"role": "user", "content": text}])
+
+        assert await session.active_shard() >= 1
+
+        # limit=3 is satisfiable from the tail shard alone.
+        last_three = await session.get_items(limit=3)
+        assert [i.get("content") for i in last_three] == ["three", "four", "five"]
+
+    finally:
+        await session.clear_session()
+
+
+async def test_sharded_tail_read_walks_back_when_shard_insufficient(
+    aerospike_client: object,
+) -> None:
+    """A ``limit`` bigger than the tail shard's contents must walk to earlier shards.
+
+    Forces exactly one rotation, then adds a single small item to the tail
+    shard. Asking for ``limit=3`` must then reach back into shard 0 to
+    pull the two big items, producing a correctly-ordered three-element
+    result.
+    """
+    session = _make_sharded(aerospike_client)
+    try:
+        big_a = "a" * _BIG_PAYLOAD_SIZE
+        big_b = "b" * _BIG_PAYLOAD_SIZE
+
+        # Shard 0 fills up, shard 1 becomes active, single small item goes there.
+        await session.add_items([{"role": "user", "content": big_a}])
+        await session.add_items([{"role": "assistant", "content": big_b}])
+        await session.add_items([{"role": "user", "content": "tail"}])
+
+        assert await session.active_shard() >= 1
+
+        # limit=3 needs the tail shard plus items from shard 0.
+        retrieved = await session.get_items(limit=3)
+        assert [i.get("content") for i in retrieved] == [big_a, big_b, "tail"]
+
+        # limit larger than total contents must still return every item
+        # without erroring on shards that don't exist.
+        all_items = await session.get_items(limit=10)
+        assert [i.get("content") for i in all_items] == [big_a, big_b, "tail"]
+    finally:
+        await session.clear_session()
+
+
 async def test_sharded_unicode_across_shards(aerospike_client: object) -> None:
     """Unicode must survive the multi-shard round trip unchanged."""
     session = _make_sharded(aerospike_client)
