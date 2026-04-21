@@ -3,6 +3,7 @@
 [Aerospike](https://aerospike.com/)-backed [`Session`](https://openai.github.io/openai-agents-python/sessions/) implementation and a small set of reference [`@function_tool`](https://openai.github.io/openai-agents-python/tools/) helpers for the [OpenAI Agents SDK](https://github.com/openai/openai-agents-python).
 
 - **`AerospikeSession`** — a `Session` implementation that persists conversation history in Aerospike, with record-level TTL, server-side atomic list operations, and single-round-trip reads and writes.
+- **`ShardedAerospikeSession`** — opt-in variant that transparently spills across multiple records when a session would exceed Aerospike's record size ceiling, with batched multi-shard reads so latency stays bounded.
 - **Reference tools** — small, LLM-friendly `@function_tool` wrappers for common patterns (user profiles, idempotency keys, handoff state, rate limiting).
 
 The goal is to make Aerospike a first-class choice for agent memory and to contribute `AerospikeSession` upstream to [`openai/openai-agents-python`](https://github.com/openai/openai-agents-python) as `agents.extensions.memory.AerospikeSession` once it has stabilized here.
@@ -68,6 +69,8 @@ See [`docs/data-model.md`](docs/data-model.md) for a deeper treatment, including
 Implemented today:
 
 - `AerospikeSession` conforming to the SDK's `Session` protocol.
+- `ShardedAerospikeSession` for unbounded session size with transparent overflow handling.
+- Typed `SessionRecordTooLargeError` in place of opaque driver errors on single-record overflow.
 - Conformance test suite against a live Aerospike Community Edition server.
 - CI matrix against Python 3.10 – 3.12 with an Aerospike CE service container.
 - Reference `@function_tool` helpers for user profiles, idempotency, handoff state, and rate limiting.

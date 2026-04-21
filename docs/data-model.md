@@ -57,8 +57,38 @@ By default, an Aerospike record is capped at **1 MiB**. For the session data mod
 Options for longer conversations:
 
 1. **Wrap with `OpenAIResponsesCompactionSession`** from the SDK's extensions. It compacts older history on a configurable threshold, shrinking the Aerospike record before it hits the limit.
-2. **Raise the limit** in your Aerospike namespace config (`write-block-size` up to 8 MiB).
-3. **Shard per message** (future work): an alternative `AerospikeSession` variant could store one record per message keyed by `{session_id}:{seq}`, similar to the MongoDB backend's design. This trades more round trips for unlimited session size. Not yet implemented here.
+2. **Switch to `ShardedAerospikeSession`** (see [Handling overflow](#handling-overflow) below) to transparently spill across multiple records while keeping reads to a single round trip.
+3. **Raise the limit** in your Aerospike namespace config (`write-block-size` up to 8 MiB).
+
+## Handling overflow
+
+`AerospikeSession` translates Aerospike's `RecordTooBig` error into a typed `SessionRecordTooLargeError` so callers can react without parsing driver error codes:
+
+```python
+from openai_agents_aerospike import AerospikeSession, SessionRecordTooLargeError
+
+try:
+    await session.add_items(items)
+except SessionRecordTooLargeError as e:
+    # e.session_id, e.attempted_payload_bytes are available on the exception
+    ...
+```
+
+The exception's message points at the four mitigations listed above. If you want the session to handle overflow itself rather than raise, use `ShardedAerospikeSession`:
+
+```python
+from openai_agents_aerospike import ShardedAerospikeSession
+
+session = ShardedAerospikeSession(
+    session_id="user-123",
+    client=client,
+    ttl=3600,
+)
+```
+
+`ShardedAerospikeSession` is a drop-in subclass with the same constructor surface. On disk, shard 0 lives at the original key and shards 1+ live at `{key_prefix}:{session_id}:shard-{n}`, so existing sessions are compatible with no migration. Writes append to the active shard; if a write would overflow, the session atomically bumps the active-shard pointer on shard 0 (via `ops.increment`, so concurrent overflows get distinct shards) and retries. Reads fan out across all shards in one `get_many` round trip and concatenate the results in shard order.
+
+The trade vs. the single-record backend: each shard is atomic per-record, but shard *transitions* are not. Under concurrent `add_items` from multiple processes racing on overflow, items from different calls may interleave at shard boundaries. Items within a single `add_items` call always stay contiguous on one shard. For single-worker-per-session workflows — the typical agent case — this is not observable.
 
 ## Why one record per session
 

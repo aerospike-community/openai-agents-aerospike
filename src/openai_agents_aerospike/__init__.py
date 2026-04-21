@@ -4,6 +4,11 @@ This package provides:
 
 - :class:`AerospikeSession`: a :class:`agents.memory.session.Session`
   implementation that persists conversation history in Aerospike.
+- :class:`ShardedAerospikeSession`: opt-in variant that transparently spills
+  across multiple records when a single record would exceed Aerospike's
+  size limit.
+- :class:`SessionRecordTooLargeError`: raised by :class:`AerospikeSession`
+  when a write would exceed the record size limit.
 - A small set of reference :func:`agents.function_tool` helpers for common
   Aerospike-backed agent patterns (user profiles, idempotency, handoff state,
   rate limiting).
@@ -31,7 +36,12 @@ Basic usage::
 
 from __future__ import annotations
 
-from .session import AerospikeSession
+from .session import AerospikeSession, SessionRecordTooLargeError
+from .sharded_session import ShardedAerospikeSession
 
-__all__ = ["AerospikeSession"]
+__all__ = [
+    "AerospikeSession",
+    "SessionRecordTooLargeError",
+    "ShardedAerospikeSession",
+]
 __version__ = "0.1.0"

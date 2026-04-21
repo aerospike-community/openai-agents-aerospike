@@ -54,6 +54,63 @@ _BIN_UPDATED_AT = "updated_at"
 _BIN_COUNTER = "counter"
 _BIN_MESSAGES = "messages"
 
+# AEROSPIKE_ERR_RECORD_TOO_BIG, returned when a write would exceed the
+# namespace's configured write-block-size (default 1 MiB).
+_ERR_RECORD_TOO_BIG = 13
+
+
+class SessionRecordTooLargeError(Exception):
+    """Raised when an ``add_items`` call would exceed Aerospike's record size limit.
+
+    Aerospike caps each record at the namespace ``write-block-size`` setting
+    (default 1 MiB). Once a session's serialized ``messages`` list plus
+    metadata bins approaches that ceiling, further appends fail with this
+    error.
+
+    Mitigations, in roughly increasing disruption:
+
+    1. Wrap the session with ``OpenAIResponsesCompactionSession`` from the
+       SDK's extensions. Compacts older history transparently.
+    2. Switch to :class:`openai_agents_aerospike.ShardedAerospikeSession`,
+       which transparently spills across multiple records when one fills up.
+    3. Raise ``write-block-size`` in the Aerospike namespace config (up to
+       8 MiB).
+    4. Shorten long tool outputs before persisting them.
+
+    Attributes:
+        session_id: The session that overflowed.
+        attempted_payload_bytes: Approximate size in bytes of the serialized
+            items that triggered the failure (upper bound on what would have
+            been appended; does not include existing record contents).
+    """
+
+    def __init__(
+        self,
+        session_id: str,
+        *,
+        attempted_payload_bytes: int | None = None,
+        cause: BaseException | None = None,
+    ) -> None:
+        msg = (
+            f"Session '{session_id}' exceeded Aerospike's record size limit "
+            f"(default 1 MiB). Options: wrap with OpenAIResponsesCompactionSession, "
+            f"switch to ShardedAerospikeSession, or raise write-block-size."
+        )
+        super().__init__(msg)
+        self.session_id = session_id
+        self.attempted_payload_bytes = attempted_payload_bytes
+        if cause is not None:
+            self.__cause__ = cause
+
+
+def _is_record_too_big(exc: BaseException) -> bool:
+    """Return True if ``exc`` is Aerospike's record-too-big error."""
+    exc_module = getattr(aerospike, "exception", None)
+    record_too_big = getattr(exc_module, "RecordTooBig", None) if exc_module else None
+    if record_too_big is not None and isinstance(exc, record_too_big):
+        return True
+    return getattr(exc, "code", None) == _ERR_RECORD_TOO_BIG
+
 
 class AerospikeSession(SessionABC):
     """Aerospike implementation of :pyclass:`agents.memory.session.Session`.
@@ -321,7 +378,16 @@ class AerospikeSession(SessionABC):
             # Ordered-list append preserves insertion order.
             list_ops.list_append_items(_BIN_MESSAGES, serialized),
         ]
-        self._client.operate(self._record_key, op_list, meta=self._write_meta())
+        try:
+            self._client.operate(self._record_key, op_list, meta=self._write_meta())
+        except Exception as exc:  # noqa: BLE001 - re-raised below
+            if _is_record_too_big(exc):
+                raise SessionRecordTooLargeError(
+                    self.session_id,
+                    attempted_payload_bytes=sum(len(s) for s in serialized),
+                    cause=exc,
+                ) from exc
+            raise
 
     async def pop_item(self) -> TResponseInputItem | None:
         """Remove and return the most recent item from the session.

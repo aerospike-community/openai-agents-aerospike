@@ -13,7 +13,7 @@ import asyncio
 import pytest
 from agents import TResponseInputItem
 
-from openai_agents_aerospike import AerospikeSession
+from openai_agents_aerospike import AerospikeSession, SessionRecordTooLargeError
 
 from .conftest import make_session
 
@@ -189,6 +189,29 @@ async def test_session_settings_limit_used_as_default(aerospike_client: object) 
         assert [i.get("content") for i in explicit] == ["m3", "m4"]
     finally:
         await session.clear_session()
+
+
+async def test_record_too_big_raises_typed_error(aerospike_session: AerospikeSession) -> None:
+    """An oversized add_items must raise SessionRecordTooLargeError, not an opaque Aerospike error.
+
+    We push a single payload large enough to exceed the 1 MiB default
+    write-block-size so that the underlying Aerospike client returns
+    AEROSPIKE_ERR_RECORD_TOO_BIG (code 13). The session is expected to
+    translate that into the public typed error with actionable metadata.
+    """
+    # ~1.5 MiB string. Well over the default 1 MiB record ceiling once JSON
+    # framing and bin overhead are added.
+    huge_content = "x" * (1_500_000)
+    with pytest.raises(SessionRecordTooLargeError) as exc_info:
+        await aerospike_session.add_items([{"role": "user", "content": huge_content}])
+
+    err = exc_info.value
+    assert err.session_id == aerospike_session.session_id
+    assert err.attempted_payload_bytes is not None
+    assert err.attempted_payload_bytes >= 1_500_000
+    # The message should steer the user toward a remediation, not leak the
+    # raw Aerospike error.
+    assert "ShardedAerospikeSession" in str(err) or "write-block-size" in str(err)
 
 
 async def test_external_client_not_closed(aerospike_client: object) -> None:

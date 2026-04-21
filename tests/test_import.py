@@ -19,6 +19,8 @@ def test_package_imports() -> None:
 
     assert openai_agents_aerospike.__version__
     assert hasattr(openai_agents_aerospike, "AerospikeSession")
+    assert hasattr(openai_agents_aerospike, "ShardedAerospikeSession")
+    assert hasattr(openai_agents_aerospike, "SessionRecordTooLargeError")
 
 
 def test_session_conforms_to_protocol() -> None:
