@@ -10,11 +10,13 @@ The goal is to make Aerospike a first-class choice for agent memory and to contr
 
 ## Installation
 
+While this project is pre-1.0 and `AerospikeSession` is on its way upstream into [`openai-agents`](https://github.com/openai/openai-agents-python), install directly from git against a pinned tag:
+
 ```bash
-pip install openai-agents-aerospike
+pip install "git+https://github.com/aerospike-community/openai-agents-aerospike@v0.1.0"
 ```
 
-This pulls in `openai-agents>=0.14` and `aerospike>=19.1`.
+This pulls in `openai-agents>=0.14` and `aerospike>=19.1`. Once `AerospikeSession` is available from the upstream SDK release, prefer importing it from `agents.extensions.memory` and use this repository only for the reference `@function_tool`s, examples, and benchmarks.
 
 ## Quick start
 

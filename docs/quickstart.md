@@ -11,8 +11,10 @@ This starts an Aerospike Community Edition server with the default `test` namesp
 ## 2. Install
 
 ```bash
-pip install openai-agents-aerospike
+pip install "git+https://github.com/aerospike-community/openai-agents-aerospike@v0.1.0"
 ```
+
+Until `AerospikeSession` is available from an upstream `openai-agents` release, install directly from this repository against a pinned tag.
 
 ## 3. Minimal session
 
