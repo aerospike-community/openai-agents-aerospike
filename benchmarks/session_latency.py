@@ -196,16 +196,25 @@ class _AerospikeBackend(_Backend):
         # has its own overload-backoff wrapper (see _call_with_overload_backoff),
         # so transient DeviceOverload errors get retried, and the circuit-
         # breaker counts each retry against the per-second error budget.
-        # At C>=16 we trip it in a second and the whole benchmark run aborts.
+        # At C>=16 we trip it within a second and the whole benchmark aborts.
         #
-        # Disable it here (max_error_rate=0). This is explicit benchmark
-        # harness behaviour, not a library default. Documented here rather
-        # than hidden behind an env var so it's obvious in the results
+        # We can't simply set max_error_rate=0: the Python client silently
+        # reverts both knobs to their defaults whenever the ratio
+        # max_error_rate/error_rate_window is outside [1, 100], and 0/anything
+        # rounds to 0 which is < 1 (see the client docs at "Client
+        # Configuration > max_error_rate"). So the way to raise the threshold
+        # as far as the SDK will let us is to push the ratio to its maximum
+        # allowed value of 100 and widen the window: max_error_rate=10000,
+        # error_rate_window=100 tolerates ~100 err/s sustained for 100 tend
+        # iterations (~100s) before tripping — well above anything the harness
+        # will produce even under heavy retry bursts. This is explicit
+        # benchmark harness behaviour, not a library default. Documented here
+        # rather than hidden behind an env var so it's obvious in the results
         # fingerprint.
         config: dict[str, Any] = {
             "hosts": [(self.host, self.port)],
-            "max_error_rate": 0,
-            "error_rate_window": 0,
+            "max_error_rate": 10000,
+            "error_rate_window": 100,
         }
         self._client = aerospike.client(config).connect()
 
@@ -242,12 +251,13 @@ class _AerospikeBackend(_Backend):
                 "port": self.port,
                 "namespace": self.namespace,
                 "set_name": self.set_name,
-                "max_error_rate": 0,
-                "error_rate_window": 0,
+                "max_error_rate": 10000,
+                "error_rate_window": 100,
                 "max_error_rate_note": (
-                    "disabled for benchmarking; harness has its own overload "
-                    "backoff and doesn't want the SDK circuit-breaker "
-                    "counting our retries"
+                    "raised to the SDK's maximum allowed ratio (100) over a "
+                    "wider window so the harness's overload-retry bursts "
+                    "don't trip the circuit breaker; the SDK silently "
+                    "reverts ratios outside [1, 100] to defaults"
                 ),
             }
         }
