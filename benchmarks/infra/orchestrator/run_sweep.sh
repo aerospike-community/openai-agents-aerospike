@@ -225,7 +225,16 @@ run_backend() {
 
   local start
   start=$(date +%s)
-  if gcloud compute ssh "$CLIENT_NAME" --zone="$ZONE" --command="$remote_cmd"; then
+  # ServerAliveInterval: gcloud ssh default doesn't send keepalive, so long
+  # aerospike/aerospike-sharded runs at C=64 with big overload retries
+  # (tens of thousands of retries over minutes) cause the session to
+  # silently drop mid-benchmark and the orchestrator reports the whole
+  # backend as FAILED. Inject an ssh keepalive so the connection survives
+  # any single-variant burst.
+  if gcloud compute ssh "$CLIENT_NAME" --zone="$ZONE" \
+      --ssh-flag="-o ServerAliveInterval=60" \
+      --ssh-flag="-o ServerAliveCountMax=10" \
+      --command="$remote_cmd"; then
     gcloud compute scp --zone="$ZONE" "${CLIENT_NAME}:${remote_out}" "$local_out"
     local elapsed=$(( $(date +%s) - start ))
     echo "[orch] ${backend} OK (${elapsed}s) -> ${local_out}"
