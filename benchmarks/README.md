@@ -7,22 +7,55 @@ Markdown summary so runs are comparable across machines and over time.
 ## Quick run
 
 ```bash
-# 1. Start Aerospike CE locally
-docker run -d --name aerospike -p 3000-3002:3000-3002 \
-    aerospike/aerospike-server:latest
+# 1. Start backends locally (one or more)
+docker run -d --name aerospike -p 3000:3000 aerospike/aerospike-server:latest
+docker run -d --name redis -p 6379:6379 redis:7-alpine
+docker run -d --name pg -p 5432:5432 \
+    -e POSTGRES_USER=bench -e POSTGRES_PASSWORD=bench -e POSTGRES_DB=bench \
+    postgres:16-alpine
 
-# 2. Install the package and the aerospike client
+# 2. Install the package and comparison-backend extras
 pip install -e .
+pip install 'redis>=5' 'sqlalchemy>=2' 'asyncpg>=0.29' aiosqlite
 
-# 3. Run the harness
+# 3. Run the harness against each backend
 export AEROSPIKE_HOST=127.0.0.1
 python benchmarks/session_latency.py --backend aerospike
 python benchmarks/session_latency.py --backend aerospike-sharded
+python benchmarks/session_latency.py --backend redis \
+    --redis-url redis://127.0.0.1:6379/0
+python benchmarks/session_latency.py --backend sqlalchemy \
+    --sqlalchemy-url 'postgresql+asyncpg://bench:bench@127.0.0.1:5432/bench'
+python benchmarks/session_latency.py --backend sqlite \
+    --sqlite-path /tmp/bench.sqlite
 ```
 
 Each run writes `benchmarks/results/<timestamp>-<backend>.json` alongside a
 `.md` summary. The `.md` file is safe to paste directly into
 `docs/benchmark-results.md`.
+
+## Backends
+
+The `--backend` flag selects which `Session` implementation is exercised.
+All of them speak the upstream [`Session` protocol][session-proto], so the
+measurement loop is identical across backends — only the client
+construction and a small amount of error-class dispatch differ.
+
+| Backend | Implementation | Provided by |
+|---|---|---|
+| `aerospike` | `AerospikeSession` (single record) | this repo |
+| `aerospike-sharded` | `ShardedAerospikeSession` (transparent overflow) | this repo |
+| `redis` | `agents.extensions.memory.RedisSession` | upstream `openai-agents` |
+| `sqlalchemy` | `agents.extensions.memory.SQLAlchemySession` | upstream `openai-agents` |
+| `sqlite` | `agents.memory.SQLiteSession` | upstream `openai-agents` |
+
+For the three upstream comparison backends, we deliberately use the
+SDK's own implementation rather than a re-implementation — so any
+published comparison is apples-to-apples against upstream's own code
+and can't be written off as "you handicapped Redis with a shoddy
+wrapper".
+
+[session-proto]: https://openai.github.io/openai-agents-python/sessions/
 
 ## What it measures
 
@@ -57,7 +90,11 @@ Before measurement begins each variant:
 | `--assistant-size` | `1024` | Assistant message size in bytes. |
 | `--iterations` | `500` | Measured turns per variant after warmup. |
 | `--warmup` | `50` | Discarded warm-up turns. |
-| `--ttl` | *(namespace default)* | Session TTL in seconds. Aerospike CE's default `test` namespace refuses non-zero TTLs; point the harness at a namespace configured for TTLs before setting this. |
+| `--ttl` | *(namespace default)* | Session TTL in seconds. Honored by `aerospike*` and `redis`; ignored by `sqlalchemy`/`sqlite` (those backends have no TTL concept). Aerospike CE's default `test` namespace refuses non-zero TTLs; point the harness at a namespace configured for TTLs before setting this. |
+| `--redis-url` | `redis://127.0.0.1:6379/0` | Redis connection URL. Falls back to `REDIS_URL`. Only consulted when `--backend redis`. |
+| `--sqlalchemy-url` | *(required for `sqlalchemy`)* | Async SQLAlchemy URL, e.g. `postgresql+asyncpg://user:pw@host:5432/db`. Falls back to `SQLALCHEMY_URL`. |
+| `--sqlalchemy-pool-size` | `32` | Engine pool size for the `sqlalchemy` backend. Should be `>=` the highest `--concurrency` value or workers queue on the pool instead of the database. |
+| `--sqlite-path` | `:memory:` | File path for the `sqlite` backend. `:memory:` is a per-connection best-case baseline; pass a real file to measure on-disk behavior. |
 
 Each `(depth, concurrency)` pair produces one variant in the output, so
 `--history-depth 0,50,200 --concurrency 1,8,64` writes nine variants.
@@ -133,13 +170,13 @@ The JSON file contains:
 
 Known gaps, addressed in later phases:
 
-- **Cross-backend comparison.** Only the two Aerospike variants are
-  exercised. A Phase 3 harness will run the same workload against
-  `SQLiteSession`, `RedisSession`, and `SQLAlchemySession` for relative
-  numbers with fair configuration and a common machine.
 - **Realistic item content.** Messages are synthetic padded strings. A
   later variant will replay captured traces from real agent runs with
   mixed item shapes (tool calls, structured outputs, binary content).
+- **Dedicated-hardware numbers.** All published numbers so far are
+  single-machine runs. The Phase 2 GCP sweep (3-node Aerospike cluster
+  + self-hosted Redis + self-hosted Postgres on equivalent compute,
+  single zone) is the planned next step.
 
 ## Reproducibility checklist
 

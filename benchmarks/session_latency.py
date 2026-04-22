@@ -47,6 +47,7 @@ from dataclasses import asdict, dataclass
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse, urlunparse
 
 import aerospike
 
@@ -68,10 +69,21 @@ _DEVICE_OVERLOAD = getattr(getattr(aerospike, "exception", None), "DeviceOverloa
 # the cluster is sustained-overloaded and surfaces the exception.
 _MAX_OVERLOAD_RETRIES_PER_ITER = 500
 
-_BACKEND_FACTORIES: dict[str, Callable[..., AerospikeSession]] = {
-    "aerospike": AerospikeSession,
-    "aerospike-sharded": ShardedAerospikeSession,
-}
+
+def _sanitize_url(url: str) -> str:
+    """Return ``url`` with any embedded password stripped, for logging."""
+    try:
+        parsed = urlparse(url)
+    except Exception:
+        return url
+    if parsed.password is None:
+        return url
+    netloc = parsed.hostname or ""
+    if parsed.username:
+        netloc = f"{parsed.username}:***@{netloc}"
+    if parsed.port:
+        netloc = f"{netloc}:{parsed.port}"
+    return urlunparse(parsed._replace(netloc=netloc))
 
 
 # ---------------------------------------------------------------------------
@@ -122,6 +134,293 @@ def _summarize(op: str, timings_ms: list[float]) -> OpStats:
 
 
 # ---------------------------------------------------------------------------
+# Backend abstraction
+# ---------------------------------------------------------------------------
+
+
+class _Backend:
+    """Abstract benchmark backend.
+
+    A backend owns the client / engine / file handle shared across all
+    sessions in a variant, constructs per-session adapter instances, and
+    declares which exception types the harness should treat as
+    transient-retryable (``retryable_overload_exceptions``) or as the
+    backend-specific equivalent of Aerospike's single-record overflow
+    (``record_too_large_exceptions``).
+    """
+
+    name: str = ""
+
+    async def setup(self) -> None:
+        """Open the shared client / engine once per variant run."""
+
+    async def teardown(self) -> None:
+        """Release the shared client / engine at the end of the run."""
+
+    def build_session(self, session_id: str, ttl: int | None) -> Any:
+        raise NotImplementedError
+
+    def retryable_overload_exceptions(self) -> tuple[type[BaseException], ...]:
+        """Exceptions the harness should catch, sleep, and retry."""
+        return ()
+
+    def record_too_large_exceptions(self) -> tuple[type[BaseException], ...]:
+        """Exceptions signaling the session outgrew the backend's record cap."""
+        return ()
+
+    def environment_extras(self) -> dict[str, Any]:
+        """Backend-specific data to embed in the environment fingerprint."""
+        return {}
+
+
+class _AerospikeBackend(_Backend):
+    name = "aerospike"
+    _session_cls: type[AerospikeSession] = AerospikeSession
+
+    def __init__(self, *, host: str, port: int, namespace: str, set_name: str) -> None:
+        self.host = host
+        self.port = port
+        self.namespace = namespace
+        self.set_name = set_name
+        self._client: Any = None
+
+    @property
+    def client(self) -> Any:
+        return self._client
+
+    async def setup(self) -> None:
+        self._client = aerospike.client({"hosts": [(self.host, self.port)]}).connect()
+
+    async def teardown(self) -> None:
+        if self._client is not None:
+            self._client.close()
+            self._client = None
+
+    def build_session(self, session_id: str, ttl: int | None) -> Any:
+        kwargs: dict[str, Any] = {
+            "session_id": session_id,
+            "client": self._client,
+            "namespace": self.namespace,
+            "set_name": self.set_name,
+        }
+        if ttl is not None:
+            kwargs["ttl"] = ttl
+        return self._session_cls(**kwargs)
+
+    def retryable_overload_exceptions(self) -> tuple[type[BaseException], ...]:
+        if _DEVICE_OVERLOAD is not None:
+            return (_DEVICE_OVERLOAD,)
+        return ()
+
+    def record_too_large_exceptions(self) -> tuple[type[BaseException], ...]:
+        return (SessionRecordTooLargeError,)
+
+    def environment_extras(self) -> dict[str, Any]:
+        return {
+            "aerospike": {
+                "client_version": _package_version("aerospike"),
+                "server_build": _aerospike_server_version(self._client),
+                "host": self.host,
+                "port": self.port,
+                "namespace": self.namespace,
+                "set_name": self.set_name,
+            }
+        }
+
+
+class _AerospikeShardedBackend(_AerospikeBackend):
+    name = "aerospike-sharded"
+    _session_cls = ShardedAerospikeSession
+
+
+class _RedisBackend(_Backend):
+    """``openai-agents`` upstream ``RedisSession`` against a shared client."""
+
+    name = "redis"
+
+    def __init__(self, *, url: str, key_prefix: str) -> None:
+        self.url = url
+        self.key_prefix = key_prefix
+        self._client: Any = None
+
+    async def setup(self) -> None:
+        import redis.asyncio as redis
+
+        # Single shared async Redis client for every task in the variant;
+        # fail fast if the URL is wrong so a bad config doesn't just
+        # surface mid-benchmark as a timeout.
+        self._client = redis.from_url(self.url)
+        await self._client.ping()
+
+    async def teardown(self) -> None:
+        if self._client is not None:
+            try:
+                await self._client.aclose()
+            except AttributeError:  # redis<5 used close()
+                await self._client.close()
+            self._client = None
+
+    def build_session(self, session_id: str, ttl: int | None) -> Any:
+        from agents.extensions.memory.redis_session import RedisSession
+
+        return RedisSession(
+            session_id=session_id,
+            redis_client=self._client,
+            key_prefix=self.key_prefix,
+            ttl=ttl,
+        )
+
+    def environment_extras(self) -> dict[str, Any]:
+        return {
+            "redis": {
+                "client_version": _package_version("redis"),
+                "url": _sanitize_url(self.url),
+                "key_prefix": self.key_prefix,
+            }
+        }
+
+
+class _SQLAlchemyBackend(_Backend):
+    """``openai-agents`` upstream ``SQLAlchemySession`` against a shared engine."""
+
+    name = "sqlalchemy"
+
+    def __init__(
+        self,
+        *,
+        url: str,
+        sessions_table: str,
+        messages_table: str,
+        pool_size: int,
+    ) -> None:
+        self.url = url
+        self.sessions_table = sessions_table
+        self.messages_table = messages_table
+        self.pool_size = pool_size
+        self._engine: Any = None
+
+    async def setup(self) -> None:
+        from sqlalchemy.ext.asyncio import create_async_engine
+
+        self._engine = create_async_engine(
+            self.url,
+            pool_size=self.pool_size,
+            max_overflow=self.pool_size,
+            pool_pre_ping=True,
+        )
+
+        # Ensure the schema exists before any task tries to read/write.
+        # SQLAlchemySession lazily creates its tables; doing it here
+        # serializes the DDL so concurrent tasks don't race on CREATE.
+        from agents.extensions.memory.sqlalchemy_session import SQLAlchemySession
+
+        # SQLAlchemySession intentionally has no close() — the engine is
+        # owned at variant scope and disposed in teardown(), so we don't
+        # release anything per-bootstrap-session.
+        bootstrap = SQLAlchemySession(
+            session_id=f"bench-bootstrap-{uuid.uuid4().hex[:8]}",
+            engine=self._engine,
+            create_tables=True,
+            sessions_table=self.sessions_table,
+            messages_table=self.messages_table,
+        )
+        await bootstrap.get_items()
+
+    async def teardown(self) -> None:
+        if self._engine is not None:
+            await self._engine.dispose()
+            self._engine = None
+
+    def build_session(self, session_id: str, ttl: int | None) -> Any:
+        from agents.extensions.memory.sqlalchemy_session import SQLAlchemySession
+
+        # SQLAlchemySession has no TTL concept, so ``ttl`` is ignored here.
+        return SQLAlchemySession(
+            session_id=session_id,
+            engine=self._engine,
+            create_tables=False,
+            sessions_table=self.sessions_table,
+            messages_table=self.messages_table,
+        )
+
+    def environment_extras(self) -> dict[str, Any]:
+        return {
+            "sqlalchemy": {
+                "version": _package_version("sqlalchemy"),
+                "url": _sanitize_url(self.url),
+                "sessions_table": self.sessions_table,
+                "messages_table": self.messages_table,
+                "pool_size": self.pool_size,
+            }
+        }
+
+
+class _SQLiteBackend(_Backend):
+    """``openai-agents`` upstream ``SQLiteSession`` (baseline / single-process)."""
+
+    name = "sqlite"
+
+    def __init__(self, *, db_path: str) -> None:
+        self.db_path = db_path
+
+    def build_session(self, session_id: str, ttl: int | None) -> Any:
+        from agents.memory.sqlite_session import SQLiteSession
+
+        return SQLiteSession(session_id=session_id, db_path=self.db_path)
+
+    def environment_extras(self) -> dict[str, Any]:
+        return {"sqlite": {"db_path": self.db_path}}
+
+
+_BACKEND_NAMES = (
+    "aerospike",
+    "aerospike-sharded",
+    "redis",
+    "sqlalchemy",
+    "sqlite",
+)
+
+
+def _build_backend(args: argparse.Namespace) -> _Backend:
+    """Construct the backend selected by ``args.backend``."""
+    name = args.backend
+    if name in ("aerospike", "aerospike-sharded"):
+        host = os.environ.get("AEROSPIKE_HOST") or args.aerospike_host
+        if not host:
+            raise SystemExit(
+                "Set AEROSPIKE_HOST or pass --aerospike-host to point at a running cluster."
+            )
+        port = int(os.environ.get("AEROSPIKE_PORT", args.aerospike_port))
+        namespace = os.environ.get("AEROSPIKE_NAMESPACE", "test")
+        cls: type[_AerospikeBackend] = (
+            _AerospikeShardedBackend if name == "aerospike-sharded" else _AerospikeBackend
+        )
+        return cls(host=host, port=port, namespace=namespace, set_name="benchmark")
+    if name == "redis":
+        url = os.environ.get("REDIS_URL") or args.redis_url
+        if not url:
+            raise SystemExit("Set REDIS_URL or pass --redis-url for the redis backend.")
+        return _RedisBackend(url=url, key_prefix="bench:session")
+    if name == "sqlalchemy":
+        url = os.environ.get("SQLALCHEMY_URL") or args.sqlalchemy_url
+        if not url:
+            raise SystemExit(
+                "Set SQLALCHEMY_URL or pass --sqlalchemy-url for the sqlalchemy backend "
+                "(example: postgresql+asyncpg://user:pw@host/db)."
+            )
+        return _SQLAlchemyBackend(
+            url=url,
+            sessions_table="bench_sessions",
+            messages_table="bench_messages",
+            pool_size=args.sqlalchemy_pool_size,
+        )
+    if name == "sqlite":
+        db_path = args.sqlite_path
+        return _SQLiteBackend(db_path=db_path)
+    raise SystemExit(f"Unknown backend: {name}")
+
+
+# ---------------------------------------------------------------------------
 # Workload
 # ---------------------------------------------------------------------------
 
@@ -138,18 +437,23 @@ def _build_message(role: str, size_bytes: int, seq: int) -> dict[str, str]:
     return {"role": role, "content": prefix + ("x" * pad)}
 
 
-async def _call_with_overload_backoff(coro_factory: Callable[[], Any]) -> Any:
-    """Await ``coro_factory()`` with jittered retry on `DeviceOverload`.
+async def _call_with_overload_backoff(
+    coro_factory: Callable[[], Any],
+    retryable: tuple[type[BaseException], ...],
+) -> Any:
+    """Await ``coro_factory()`` with jittered retry on backend-declared overload.
 
     ``coro_factory`` is called fresh each retry — a coroutine object can
-    only be awaited once.
+    only be awaited once. ``retryable`` is the backend's declared set of
+    transient-retryable exception types; passing ``()`` makes this a
+    thin pass-through.
     """
     attempts = 0
     while True:
         try:
             return await coro_factory()
         except Exception as exc:
-            if _DEVICE_OVERLOAD is not None and isinstance(exc, _DEVICE_OVERLOAD):
+            if retryable and isinstance(exc, retryable):
                 attempts += 1
                 if attempts > _MAX_OVERLOAD_RETRIES_PER_ITER:
                     raise
@@ -160,11 +464,12 @@ async def _call_with_overload_backoff(coro_factory: Callable[[], Any]) -> Any:
 
 
 async def _preload_session(
-    session: AerospikeSession,
+    session: Any,
     *,
     depth: int,
     user_size: int,
     assistant_size: int,
+    retryable: tuple[type[BaseException], ...],
 ) -> None:
     """Seed ``session`` with ``depth`` alternating user/assistant items."""
     if depth <= 0:
@@ -182,7 +487,7 @@ async def _preload_session(
         async def _add(payload: list[Any] = items) -> None:
             await session.add_items(payload)
 
-        await _call_with_overload_backoff(_add)
+        await _call_with_overload_backoff(_add, retryable)
 
 
 @dataclass
@@ -201,9 +506,7 @@ class _TaskResult:
 async def _run_one_task(
     *,
     task_id: int,
-    backend: str,
-    factory: Callable[..., AerospikeSession],
-    client: Any,
+    backend: _Backend,
     depth: int,
     user_size: int,
     assistant_size: int,
@@ -214,25 +517,26 @@ async def _run_one_task(
     """Drive a single session through warmup + measurement.
 
     A *task* is one session being exercised by one asyncio task against the
-    shared Aerospike client. When ``concurrency > 1``, many of these run
+    shared backend client. When ``concurrency > 1``, many of these run
     concurrently (see :func:`_run_one_variant`) so the distributions
     aggregate the experience of parallel sessions sharing one client
     connection pool.
     """
-    session_id = f"bench-{backend}-{depth}-t{task_id}-{uuid.uuid4().hex[:8]}"
-    session_kwargs: dict[str, Any] = {
-        "session_id": session_id,
-        "client": client,
-        "namespace": os.environ.get("AEROSPIKE_NAMESPACE", "test"),
-        "set_name": "benchmark",
-    }
-    if ttl is not None:
-        session_kwargs["ttl"] = ttl
-    session = factory(**session_kwargs)
+    retryable = backend.retryable_overload_exceptions()
+    too_large = backend.record_too_large_exceptions()
+
+    session_id = f"bench-{backend.name}-{depth}-t{task_id}-{uuid.uuid4().hex[:8]}"
+    session = backend.build_session(session_id, ttl)
 
     # Ensure a fresh record even if a prior aborted run left something behind.
-    await _call_with_overload_backoff(session.clear_session)
-    await _preload_session(session, depth=depth, user_size=user_size, assistant_size=assistant_size)
+    await _call_with_overload_backoff(session.clear_session, retryable)
+    await _preload_session(
+        session,
+        depth=depth,
+        user_size=user_size,
+        assistant_size=assistant_size,
+        retryable=retryable,
+    )
 
     get_ms: list[float] = []
     add_ms: list[float] = []
@@ -244,9 +548,13 @@ async def _run_one_task(
     async def _rotate() -> None:
         nonlocal rotations
         rotations += 1
-        await _call_with_overload_backoff(session.clear_session)
+        await _call_with_overload_backoff(session.clear_session, retryable)
         await _preload_session(
-            session, depth=depth, user_size=user_size, assistant_size=assistant_size
+            session,
+            depth=depth,
+            user_size=user_size,
+            assistant_size=assistant_size,
+            retryable=retryable,
         )
 
     try:
@@ -268,25 +576,25 @@ async def _run_one_task(
                 t1 = time.perf_counter()
                 await session.add_items(turn_items)
                 t2 = time.perf_counter()
-            except SessionRecordTooLargeError:
-                # Non-sharded backend hit the 1 MiB cap. Reset and retry the
-                # same iteration slot so we still collect `iterations`
-                # measured turns.
-                retries_dropped += 1
-                await _rotate()
-                iter_overload_retries = 0
-                continue
             except Exception as exc:
-                # Transient write throttling from the server. Back off and
-                # retry the same iteration. The failed op's timing is
-                # discarded; only cleanly completed turns feed the
-                # distribution.
-                if _DEVICE_OVERLOAD is not None and isinstance(exc, _DEVICE_OVERLOAD):
+                if too_large and isinstance(exc, too_large):
+                    # Backend hit its per-record cap. Reset and retry the
+                    # same iteration slot so we still collect
+                    # ``iterations`` measured turns. Only Aerospike
+                    # declares this today.
+                    retries_dropped += 1
+                    await _rotate()
+                    iter_overload_retries = 0
+                    continue
+                if retryable and isinstance(exc, retryable):
+                    # Transient backend throttling. Back off and retry
+                    # the same iteration. The failed op's timing is
+                    # discarded; only cleanly completed turns feed the
+                    # distribution.
                     overload_retries += 1
                     iter_overload_retries += 1
                     if iter_overload_retries > _MAX_OVERLOAD_RETRIES_PER_ITER:
                         raise
-                    # Jittered exponential backoff, capped at 250 ms.
                     backoff = min(0.25, 0.005 * (2 ** min(iter_overload_retries, 6)))
                     await asyncio.sleep(backoff * (0.5 + random.random()))
                     continue
@@ -305,7 +613,10 @@ async def _run_one_task(
             await session.clear_session()
         except Exception:
             pass
-        await session.close()
+        try:
+            await session.close()
+        except Exception:
+            pass
 
     return _TaskResult(
         task_id=task_id,
@@ -320,9 +631,7 @@ async def _run_one_task(
 
 async def _run_one_variant(
     *,
-    backend: str,
-    factory: Callable[..., AerospikeSession],
-    client: Any,
+    backend: _Backend,
     depth: int,
     concurrency: int,
     user_size: int,
@@ -333,7 +642,7 @@ async def _run_one_variant(
 ) -> dict[str, Any]:
     """Run one (backend, depth, concurrency) variant and return summaries.
 
-    ``concurrency`` tasks share a single Aerospike client (that's the
+    ``concurrency`` tasks share a single backend-owned client (that's the
     connection pool we're trying to exercise — one client per task would
     hide whatever the pool does under load). Each task gets its own
     session, warms up independently, and is measured for ``iterations``
@@ -346,8 +655,6 @@ async def _run_one_variant(
         _run_one_task(
             task_id=t,
             backend=backend,
-            factory=factory,
-            client=client,
             depth=depth,
             user_size=user_size,
             assistant_size=assistant_size,
@@ -383,7 +690,7 @@ async def _run_one_variant(
     throughput_tps = len(all_turn) / wall_seconds if wall_seconds > 0 else 0.0
 
     return {
-        "backend": backend,
+        "backend": backend.name,
         "history_depth_before_bench": depth,
         "concurrency": concurrency,
         "warmup": warmup,
@@ -476,10 +783,10 @@ def _package_version(name: str) -> str | None:
         return None
 
 
-def _capture_environment(client: Any, backend: str) -> dict[str, Any]:
-    return {
+def _capture_environment(backend: _Backend) -> dict[str, Any]:
+    env: dict[str, Any] = {
         "timestamp_utc": datetime.now(timezone.utc).isoformat(),
-        "backend": backend,
+        "backend": backend.name,
         "git_sha": _git_sha(),
         "git_dirty": _git_dirty(),
         "python": {
@@ -494,15 +801,11 @@ def _capture_environment(client: Any, backend: str) -> dict[str, Any]:
             "processor": platform.processor() or None,
             "cpu_count": os.cpu_count(),
         },
-        "aerospike": {
-            "client_version": _package_version("aerospike"),
-            "server_build": _aerospike_server_version(client),
-            "host": os.environ.get("AEROSPIKE_HOST"),
-            "namespace": os.environ.get("AEROSPIKE_NAMESPACE", "test"),
-        },
         "openai_agents_version": _package_version("openai-agents"),
         "openai_agents_aerospike_version": _package_version("openai-agents-aerospike"),
     }
+    env.update(backend.environment_extras())
+    return env
 
 
 # ---------------------------------------------------------------------------
@@ -525,8 +828,19 @@ def _render_markdown_summary(env: dict[str, Any], variants: list[dict[str, Any]]
         f"{py['processor']} / {py['cpu_count']} logical CPUs"
     )
     lines.append(f"- python: {env['python']['version']} ({env['python']['implementation']})")
-    aero = env["aerospike"]
-    lines.append(f"- aerospike client: {aero['client_version']}, server: {aero['server_build']}")
+    if "aerospike" in env:
+        aero = env["aerospike"]
+        lines.append(
+            f"- aerospike client: {aero.get('client_version')}, server: {aero.get('server_build')}"
+        )
+    if "redis" in env:
+        r = env["redis"]
+        lines.append(f"- redis client: {r.get('client_version')} @ {r.get('url')}")
+    if "sqlalchemy" in env:
+        sa = env["sqlalchemy"]
+        lines.append(f"- sqlalchemy: {sa.get('version')} @ {sa.get('url')}")
+    if "sqlite" in env:
+        lines.append(f"- sqlite db_path: {env['sqlite'].get('db_path')}")
     lines.append(f"- openai-agents: {env['openai_agents_version']}")
     lines.append("")
 
@@ -648,18 +962,10 @@ def _render_markdown_summary(env: dict[str, Any], variants: list[dict[str, Any]]
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    factory = _BACKEND_FACTORIES[args.backend]
+    backend = _build_backend(args)
+    await backend.setup()
 
-    host = os.environ.get("AEROSPIKE_HOST") or args.aerospike_host
-    if not host:
-        raise SystemExit(
-            "Set AEROSPIKE_HOST or pass --aerospike-host to point at a running cluster."
-        )
-    port = int(os.environ.get("AEROSPIKE_PORT", args.aerospike_port))
-
-    client = aerospike.client({"hosts": [(host, port)]}).connect()
-
-    env = _capture_environment(client, args.backend)
+    env = _capture_environment(backend)
 
     depths = [int(d) for d in args.history_depth.split(",") if d.strip()]
     concurrencies = [int(c) for c in args.concurrency.split(",") if c.strip()]
@@ -671,15 +977,13 @@ async def main_async(args: argparse.Namespace) -> None:
         for depth in depths:
             for concurrency in concurrencies:
                 print(
-                    f"=> running backend={args.backend} depth={depth} "
+                    f"=> running backend={backend.name} depth={depth} "
                     f"concurrency={concurrency} "
                     f"warmup={args.warmup} iters={args.iterations}",
                     flush=True,
                 )
                 variant = await _run_one_variant(
-                    backend=args.backend,
-                    factory=factory,
-                    client=client,
+                    backend=backend,
                     depth=depth,
                     concurrency=concurrency,
                     user_size=args.user_size,
@@ -693,7 +997,7 @@ async def main_async(args: argparse.Namespace) -> None:
                 if args.cool_down_seconds > 0:
                     await asyncio.sleep(args.cool_down_seconds)
     finally:
-        client.close()
+        await backend.teardown()
 
     output_path = _resolve_output_path(args)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -775,7 +1079,7 @@ def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__.split("\n\n")[0])
     parser.add_argument(
         "--backend",
-        choices=sorted(_BACKEND_FACTORIES.keys()),
+        choices=_BACKEND_NAMES,
         default="aerospike",
         help="Session backend to exercise.",
     )
@@ -859,6 +1163,40 @@ def parse_args() -> argparse.Namespace:
         type=int,
         default=3000,
         help="Seed port (fallback if AEROSPIKE_PORT is unset).",
+    )
+    parser.add_argument(
+        "--redis-url",
+        default="redis://127.0.0.1:6379/0",
+        help="Redis connection URL (fallback if REDIS_URL is unset).",
+    )
+    parser.add_argument(
+        "--sqlalchemy-url",
+        default=None,
+        help=(
+            "SQLAlchemy async URL for the sqlalchemy backend "
+            "(example: postgresql+asyncpg://user:pw@host:5432/dbname). "
+            "Falls back to SQLALCHEMY_URL."
+        ),
+    )
+    parser.add_argument(
+        "--sqlalchemy-pool-size",
+        type=int,
+        default=32,
+        help=(
+            "Connection pool size for the sqlalchemy backend. Should be "
+            ">= your highest --concurrency value or workers will queue "
+            "on the pool instead of hitting the database."
+        ),
+    )
+    parser.add_argument(
+        "--sqlite-path",
+        default=":memory:",
+        help=(
+            "Path to the SQLite file for the sqlite backend. Default "
+            "':memory:' is per-connection in-memory and only meaningful "
+            "as a best-case baseline; pass a real file to measure "
+            "on-disk SQLite."
+        ),
     )
     return parser.parse_args()
 
