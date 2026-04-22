@@ -48,3 +48,13 @@ coverage.xml
 benchmarks/results/*.json
 benchmarks/results/*.csv
 !benchmarks/results/.gitkeep
+
+# Terraform: provider cache, state, and local override files.
+# .terraform.lock.hcl IS intentionally committed (it's the lockfile).
+**/.terraform/
+*.tfstate
+*.tfstate.*
+*.tfplan
+*.auto.tfvars
+terraform.tfvars
+!terraform.tfvars.example
