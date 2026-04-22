@@ -3,6 +3,9 @@ __pycache__/
 *$py.class
 *.so
 
+# Internal-only notes, strategy docs, scratch. Not for public repo.
+internal/
+
 .Python
 build/
 develop-eggs/
