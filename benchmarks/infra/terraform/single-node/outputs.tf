@@ -3,6 +3,11 @@ output "topology" {
   value       = "single-node"
 }
 
+output "zone" {
+  description = "GCP zone all VMs live in. Orchestrator passes this to `gcloud compute ssh --zone=...`."
+  value       = var.zone
+}
+
 output "aerospike_nodes" {
   description = "Aerospike node details (name, internal_ip, external_ip)."
   value       = module.aerospike.nodes

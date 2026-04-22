@@ -60,6 +60,12 @@ variable "server_version" {
   default     = "7.2.0.3"
 }
 
+variable "tools_version" {
+  description = "Aerospike tools version bundled with server_version. Server EE ships as a combined server+tools tarball named 'aerospike-server-enterprise_<server>_tools-<tools>_ubuntu22.04_x86_64.tgz'. Bump when server_version bumps."
+  type        = string
+  default     = "11.1.0"
+}
+
 variable "features_conf_path" {
   description = "Path (from module caller) to a valid Aerospike EE feature-key file. Multi-node keys required for node_count > 1."
   type        = string
