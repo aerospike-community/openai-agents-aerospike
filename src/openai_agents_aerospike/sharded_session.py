@@ -21,9 +21,11 @@ Writes target the current ``active_shard``. If the write fails with
 ``active_shard`` on shard 0 (via ``ops.increment``, so concurrent overflows get
 distinct new shard numbers) and retries on the new shard.
 
-Reads fan out across all shards in a single round trip using
-:meth:`aerospike.Client.get_many`, so latency stays bounded regardless of
-how many shards a long-lived session has accumulated.
+Bounded reads (``get_items(limit=N)``) walk shards from the active one
+backward using ``list_get_range(bin, -need, need)`` and stop as soon as
+``N`` items have been collected, so latency is decoupled from how many
+shards a long-lived session has accumulated. Unbounded reads fan out
+across every shard in a single ``batch_read`` round trip.
 
 Tradeoff vs. :class:`AerospikeSession`: each shard is atomic per-record, but
 shard *transitions* are not. Under concurrent ``add_items`` calls from
@@ -39,6 +41,7 @@ import asyncio
 import json
 from typing import Any
 
+import aerospike
 from aerospike_helpers.operations import list_operations as list_ops, operations as ops
 from agents.items import TResponseInputItem
 from agents.memory.session_settings import resolve_session_limit
@@ -53,6 +56,11 @@ from .session import (
     SessionRecordTooLargeError,
     _is_record_too_big,
 )
+
+# Cached once at import time so per-call exception handlers don't pay for the
+# ``getattr`` dance. ``None`` means the installed client doesn't export the type,
+# in which case we just won't treat that specific case specially.
+_OP_NOT_APPLICABLE = getattr(getattr(aerospike, "exception", None), "OpNotApplicable", None)
 
 _BIN_ACTIVE_SHARD = "active_shard"
 
@@ -226,20 +234,33 @@ class ShardedAerospikeSession(AerospikeSession):
         return items
 
     def _get_items_sharded_sync(self, session_limit: int | None) -> list[Any]:
-        """Fan-out read across all shards in one ``batch_read`` round trip.
+        """Return raw (serialized) messages for this session.
 
-        We read every shard's ``messages`` list in full, concatenate in
-        shard order, and slice client-side when ``session_limit`` is set.
-        This keeps the implementation straightforward while preserving the
-        single-round-trip latency profile. A tail-first optimization that
-        reads only enough shards to satisfy ``session_limit`` is possible
-        but unnecessary until real-world shard counts grow significantly
-        beyond a handful.
+        Two read paths:
+
+        * ``session_limit is None`` (load entire history): fan-out across
+          every shard in a single ``batch_read`` round trip. This is the
+          only safe option when the caller needs everything, and it still
+          keeps latency bounded by shard count rather than item count.
+        * ``session_limit is not None`` (bounded load, the SDK's hot path):
+          walk shards from the active one backward, using
+          ``list_get_range(bin, -need, need)`` on each to fetch only the
+          *tail* of that shard. Stop as soon as ``session_limit`` items
+          have been collected. In the common case where the active shard
+          holds more items than the caller asks for, this is exactly two
+          round trips (active-shard pointer + tail of active shard),
+          regardless of how many shards the session has accumulated.
         """
         active = self._read_active_shard()
         if active == 0:
             return super()._get_items_sync(session_limit)
 
+        if session_limit is None:
+            return self._read_all_shards(active)
+        return self._read_tail(active, session_limit)
+
+    def _read_all_shards(self, active: int) -> list[Any]:
+        """Unbounded read: fetch every shard's messages list in one batch."""
         keys = [self._shard_key(n) for n in range(active + 1)]
         batch = self._client.batch_read(keys, [_BIN_MESSAGES])
 
@@ -263,9 +284,41 @@ class ShardedAerospikeSession(AerospikeSession):
         for shard in range(active + 1):
             shard_user_key = self._shard_key(shard)[2]
             collected.extend(by_user_key.get(shard_user_key, []))
+        return collected
 
-        if session_limit is not None and len(collected) > session_limit:
-            collected = collected[-session_limit:]
+    def _read_tail(self, active: int, session_limit: int) -> list[Any]:
+        """Bounded read: walk shards backward until we have ``session_limit`` items.
+
+        For each shard visited, issue ``list_get_range(bin, -need, need)`` to
+        fetch only the items we still need from that shard's tail. Shards
+        that are missing, emptied, or lack the messages bin are silently
+        skipped.
+        """
+        need = session_limit
+        collected: list[Any] = []
+        for shard in range(active, -1, -1):
+            if need <= 0:
+                break
+            try:
+                _, _, bins = self._client.operate(
+                    self._shard_key(shard),
+                    [list_ops.list_get_range(_BIN_MESSAGES, -need, need)],
+                )
+            except Exception as exc:  # noqa: BLE001 - translated below
+                if self._handle_missing_record(exc):
+                    continue
+                if _OP_NOT_APPLICABLE is not None and isinstance(exc, _OP_NOT_APPLICABLE):
+                    # Shard exists but has no messages bin / empty list.
+                    continue
+                raise
+            tail = bins.get(_BIN_MESSAGES)
+            if not tail:
+                continue
+            # ``tail`` is the newest-to-the-right slice of this shard in
+            # insertion order; earlier shards hold older messages, so we
+            # prepend rather than append to preserve global ordering.
+            collected = list(tail) + collected
+            need = session_limit - len(collected)
         return collected
 
     # ------------------------------------------------------------------
@@ -282,11 +335,6 @@ class ShardedAerospikeSession(AerospikeSession):
         only by :meth:`clear_session`.
         """
         active = self._read_active_shard()
-        import aerospike
-
-        exc_module = getattr(aerospike, "exception", None)
-        op_not_applicable = getattr(exc_module, "OpNotApplicable", None) if exc_module else None
-
         for shard in range(active, -1, -1):
             try:
                 _, _, bins = self._client.operate(
@@ -301,7 +349,7 @@ class ShardedAerospikeSession(AerospikeSession):
             except Exception as exc:  # noqa: BLE001
                 if self._handle_missing_record(exc):
                     pass  # Shard never existed; try the next one down.
-                elif op_not_applicable is not None and isinstance(exc, op_not_applicable):
+                elif _OP_NOT_APPLICABLE is not None and isinstance(exc, _OP_NOT_APPLICABLE):
                     pass  # Empty list on this shard; contract pointer, keep going.
                 else:
                     raise
