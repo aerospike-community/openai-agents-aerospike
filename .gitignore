@@ -47,6 +47,7 @@ coverage.xml
 
 benchmarks/results/*.json
 benchmarks/results/*.csv
+benchmarks/results/gcp/
 !benchmarks/results/.gitkeep
 
 # Terraform: provider cache, state, and local override files.
