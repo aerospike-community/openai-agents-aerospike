@@ -189,7 +189,25 @@ class _AerospikeBackend(_Backend):
         return self._client
 
     async def setup(self) -> None:
-        self._client = aerospike.client({"hosts": [(self.host, self.port)]}).connect()
+        # The default max_error_rate=100 / error_rate_window=1 defensive
+        # circuit-breaker in the Aerospike C client is designed for real
+        # apps where a runaway error spike means "the cluster is sick, stop
+        # hammering it." For benchmarks that's harmful: the harness already
+        # has its own overload-backoff wrapper (see _call_with_overload_backoff),
+        # so transient DeviceOverload errors get retried, and the circuit-
+        # breaker counts each retry against the per-second error budget.
+        # At C>=16 we trip it in a second and the whole benchmark run aborts.
+        #
+        # Disable it here (max_error_rate=0). This is explicit benchmark
+        # harness behaviour, not a library default. Documented here rather
+        # than hidden behind an env var so it's obvious in the results
+        # fingerprint.
+        config: dict[str, Any] = {
+            "hosts": [(self.host, self.port)],
+            "max_error_rate": 0,
+            "error_rate_window": 0,
+        }
+        self._client = aerospike.client(config).connect()
 
     async def teardown(self) -> None:
         if self._client is not None:
@@ -224,6 +242,13 @@ class _AerospikeBackend(_Backend):
                 "port": self.port,
                 "namespace": self.namespace,
                 "set_name": self.set_name,
+                "max_error_rate": 0,
+                "error_rate_window": 0,
+                "max_error_rate_note": (
+                    "disabled for benchmarking; harness has its own overload "
+                    "backoff and doesn't want the SDK circuit-breaker "
+                    "counting our retries"
+                ),
             }
         }
 
