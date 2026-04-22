@@ -1,0 +1,11 @@
+# Copy to terraform.tfvars and fill in.
+
+project_id       = "YOUR_GCP_PROJECT_ID"
+allowed_ssh_cidr = "YOUR.WORKSTATION.IP/32"
+
+# Aerospike EE feature-key file (kept in internal/ via .gitignore).
+# Path is relative to this root directory.
+aerospike_features_conf_path = "../../../../internal/features.conf"
+
+# aerospike_replication_factor = 2
+# repo_ref = "main"
