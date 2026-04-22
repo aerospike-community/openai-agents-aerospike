@@ -55,15 +55,15 @@ variable "namespace" {
 }
 
 variable "server_version" {
-  description = "Aerospike Enterprise server version to install."
+  description = "Aerospike Enterprise server version to install. 8.0 is the current GA line; 8.x adds hot-key write-pipeline improvements over 7.2 that show up under high-concurrency sharded workloads."
   type        = string
-  default     = "7.2.0.3"
+  default     = "8.0.0.15"
 }
 
 variable "tools_version" {
-  description = "Aerospike tools version bundled with server_version. Server EE ships as a combined server+tools tarball named 'aerospike-server-enterprise_<server>_tools-<tools>_ubuntu22.04_x86_64.tgz'. Bump when server_version bumps."
+  description = "Aerospike tools version bundled with server_version. Server EE ships as a combined server+tools tarball named 'aerospike-server-enterprise_<server>_tools-<tools>_ubuntu22.04_x86_64.tgz'. Bump when server_version bumps. AS 8.0.0.15 ships with tools 13.0.0."
   type        = string
-  default     = "11.1.0"
+  default     = "13.0.0"
 }
 
 variable "features_conf_path" {

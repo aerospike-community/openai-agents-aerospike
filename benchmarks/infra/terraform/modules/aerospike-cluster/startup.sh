@@ -51,12 +51,12 @@ done
 apt-get update
 apt-get install -y curl gnupg lsb-release python3 ca-certificates parted
 
-# Aerospike EE 7.x ships as a combined server + tools tarball, not a
-# standalone deb. Extract both debs and install together.
+# Aerospike EE 7.x and 8.x ship as a combined server + tools tarball,
+# not a standalone deb. Extract both debs and install together.
 #
-# The tools version (currently 11.1.0) is bundled with the server release
-# and usually only changes across server minor versions; keep it in the
-# URL rather than try to auto-discover.
+# The tools version (currently 13.0.0 for AS 8.0.0.15) is bundled with
+# the server release and usually only changes across server minor
+# versions; keep it in the URL rather than try to auto-discover.
 TOOLS_VERSION=$(curl -fsS "${HDR[@]}" "${META}/aerospike-tools-version")
 TGZ_URL="https://download.aerospike.com/artifacts/aerospike-server-enterprise/${VERSION}/aerospike-server-enterprise_${VERSION}_tools-${TOOLS_VERSION}_ubuntu22.04_x86_64.tgz"
 curl -fsSL -o /tmp/aerospike.tgz "${TGZ_URL}"
@@ -169,17 +169,13 @@ namespace ${NAMESPACE} {
 
     storage-engine device {
 ${DEVICE_LINES%$'\n'}
-        # Aerospike 7.x reworked the storage-engine config: most of the
-        # 6.x pct-based knobs (high-water-disk-pct, stop-writes-pct,
-        # write-block-size) were removed or renamed. We keep the two
-        # that 7.x still accepts and that matter for SSD workloads:
-        #   flush-size: how big each flush IO is (tune per device)
-        #   defrag-lwm-pct: when to reclaim partially-used blocks
-        # Everything else — eviction, post-write cache, etc — uses the
-        # sensible 7.x defaults. Revisit after a baseline run if we
-        # see defrag pressure or eviction surprises in the telemetry.
-        flush-size 128K
-        defrag-lwm-pct 50
+        # AS 8.0 config matches what aerolab ships with: let the
+        # storage engine pick flush-size and defrag-lwm-pct defaults
+        # based on device probing. We ran 8.0 against aerolab and its
+        # defaults against ours with only our explicit knobs changed;
+        # dropping the overrides brought us to parity. Add them back
+        # only if telemetry shows defrag pressure or tail-latency
+        # regressions.
 ${COMMIT_LINE}
     }
 }

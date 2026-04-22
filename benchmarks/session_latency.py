@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import concurrent.futures
 import json
 import os
 import platform
@@ -541,6 +542,10 @@ class _TaskResult:
 async def _run_one_task(
     *,
     task_id: int,
+    session_slot: int,
+    session_salt: str,
+    slot_primary: bool,
+    setup_event: asyncio.Event | None,
     backend: _Backend,
     depth: int,
     user_size: int,
@@ -551,27 +556,40 @@ async def _run_one_task(
 ) -> _TaskResult:
     """Drive a single session through warmup + measurement.
 
-    A *task* is one session being exercised by one asyncio task against the
-    shared backend client. When ``concurrency > 1``, many of these run
-    concurrently (see :func:`_run_one_variant`) so the distributions
-    aggregate the experience of parallel sessions sharing one client
-    connection pool.
+    A *task* is one asyncio task exercising one ``session_slot`` (logical
+    session) against the shared backend client. Tasks and sessions are
+    separate concepts: when ``--sessions`` < ``--concurrency``, multiple
+    tasks share a session_slot (modelling contention on a hot record),
+    and per-task cleanup/warmup is gated so we don't step on each other.
     """
     retryable = backend.retryable_overload_exceptions()
     too_large = backend.record_too_large_exceptions()
 
-    session_id = f"bench-{backend.name}-{depth}-t{task_id}-{uuid.uuid4().hex[:8]}"
+    # session_slot identifies the shared record; session_salt makes it
+    # unique per variant so we don't collide with leftover state from
+    # an earlier sweep. task_id is deliberately not in the session_id:
+    # two tasks with the same session_slot MUST produce the same
+    # session_id or the shared-record experiment is pointless.
+    session_id = f"bench-{backend.name}-{depth}-s{session_slot}-{session_salt}"
     session = backend.build_session(session_id, ttl)
 
-    # Ensure a fresh record even if a prior aborted run left something behind.
-    await _call_with_overload_backoff(session.clear_session, retryable)
-    await _preload_session(
-        session,
-        depth=depth,
-        user_size=user_size,
-        assistant_size=assistant_size,
-        retryable=retryable,
-    )
+    # Only the slot primary clears and preloads; followers wait for the
+    # shared record to be ready before measurement starts. When sessions
+    # == concurrency (the default), every task is its own primary and
+    # this is a no-op event set immediately.
+    if setup_event is None or slot_primary:
+        await _call_with_overload_backoff(session.clear_session, retryable)
+        await _preload_session(
+            session,
+            depth=depth,
+            user_size=user_size,
+            assistant_size=assistant_size,
+            retryable=retryable,
+        )
+        if setup_event is not None:
+            setup_event.set()
+    else:
+        await setup_event.wait()
 
     get_ms: list[float] = []
     add_ms: list[float] = []
@@ -644,10 +662,14 @@ async def _run_one_task(
             i += 1
     finally:
         # Task-owned cleanup only; the shared client lives at variant scope.
-        try:
-            await session.clear_session()
-        except Exception:
-            pass
+        # When sessions < concurrency, only the slot primary clears the
+        # record so followers don't wipe it out from under a sibling
+        # that's still finishing its last iteration.
+        if slot_primary:
+            try:
+                await session.clear_session()
+            except Exception:
+                pass
         try:
             await session.close()
         except Exception:
@@ -669,6 +691,7 @@ async def _run_one_variant(
     backend: _Backend,
     depth: int,
     concurrency: int,
+    sessions: int | None,
     user_size: int,
     assistant_size: int,
     warmup: int,
@@ -679,16 +702,35 @@ async def _run_one_variant(
 
     ``concurrency`` tasks share a single backend-owned client (that's the
     connection pool we're trying to exercise — one client per task would
-    hide whatever the pool does under load). Each task gets its own
-    session, warms up independently, and is measured for ``iterations``
-    turns. Per-task timings are unioned into a single distribution for
-    the headline p50/p95/p99, and per-task summaries are preserved in
-    the output so fan-out effects (one slow task vs. uniformly slow) are
-    visible without re-running the bench.
+    hide whatever the pool does under load). Each task is assigned a
+    ``session_slot`` via ``task_id % num_sessions`` where ``num_sessions``
+    defaults to ``concurrency`` (realistic agent shape: one session per
+    task) and can be narrowed via ``--sessions`` to deliberately create
+    contention on a smaller set of records.
     """
+    num_sessions = concurrency if sessions is None else min(sessions, concurrency)
+    # Fresh salt per variant so retries from an earlier failed variant
+    # don't leak state into this one.
+    session_salt = uuid.uuid4().hex[:8]
+    # One coordination event per slot, set by the slot primary after
+    # clear + preload so followers know the record is ready. None when
+    # sessions == concurrency — every task is its own primary, no
+    # barrier needed.
+    setup_events: list[asyncio.Event | None]
+    if num_sessions < concurrency:
+        setup_events = [asyncio.Event() for _ in range(num_sessions)]
+    else:
+        setup_events = [None] * num_sessions
+
+    # A slot's primary is the lowest task_id that maps to it. With the
+    # modulo assignment below, that's always the task whose id < num_sessions.
     tasks = [
         _run_one_task(
             task_id=t,
+            session_slot=t % num_sessions,
+            session_salt=session_salt,
+            slot_primary=(t < num_sessions),
+            setup_event=setup_events[t % num_sessions],
             backend=backend,
             depth=depth,
             user_size=user_size,
@@ -728,6 +770,8 @@ async def _run_one_variant(
         "backend": backend.name,
         "history_depth_before_bench": depth,
         "concurrency": concurrency,
+        "sessions": num_sessions,
+        "tasks_per_session": concurrency / num_sessions if num_sessions else 0,
         "warmup": warmup,
         "iterations": iterations,
         "user_size_bytes": user_size,
@@ -997,15 +1041,49 @@ def _render_markdown_summary(env: dict[str, Any], variants: list[dict[str, Any]]
 
 
 async def main_async(args: argparse.Namespace) -> None:
-    backend = _build_backend(args)
-    await backend.setup()
-
-    env = _capture_environment(backend)
-
     depths = [int(d) for d in args.history_depth.split(",") if d.strip()]
     concurrencies = [int(c) for c in args.concurrency.split(",") if c.strip()]
     if any(c < 1 for c in concurrencies):
         raise SystemExit("--concurrency values must be >= 1")
+
+    # Resize asyncio's default ThreadPoolExecutor before any to_thread calls.
+    # The sync Aerospike client dispatches via to_thread, so if the pool is
+    # smaller than concurrency, every variant's effective parallelism is
+    # capped at the pool size rather than the --concurrency flag. Python's
+    # default is min(32, cpu+4), which on an 8-vCPU client silently caps us
+    # at ~12 and masquerades as server-side saturation.
+    max_concurrency = max(concurrencies)
+    if args.max_worker_threads is not None:
+        pool_size = max(1, args.max_worker_threads)
+    else:
+        pool_size = max(64, 4 * max_concurrency)
+    loop = asyncio.get_running_loop()
+    loop.set_default_executor(
+        concurrent.futures.ThreadPoolExecutor(
+            max_workers=pool_size,
+            thread_name_prefix="bench-worker",
+        )
+    )
+    print(f"=> asyncio default-executor max_workers={pool_size}", flush=True)
+
+    if args.sessions is not None:
+        if args.sessions < 1:
+            raise SystemExit("--sessions must be >= 1")
+        if args.sessions > max_concurrency:
+            print(
+                f"=> warning: --sessions={args.sessions} > max --concurrency "
+                f"({max_concurrency}); some sessions will never be touched",
+                flush=True,
+            )
+
+    backend = _build_backend(args)
+    await backend.setup()
+
+    env = _capture_environment(backend)
+    env["harness"] = {
+        "executor_max_workers": pool_size,
+        "sessions_override": args.sessions,
+    }
     variants: list[dict[str, Any]] = []
 
     try:
@@ -1021,6 +1099,7 @@ async def main_async(args: argparse.Namespace) -> None:
                     backend=backend,
                     depth=depth,
                     concurrency=concurrency,
+                    sessions=args.sessions,
                     user_size=args.user_size,
                     assistant_size=args.assistant_size,
                     warmup=args.warmup,
@@ -1043,6 +1122,7 @@ async def main_async(args: argparse.Namespace) -> None:
             "backend": args.backend,
             "history_depths": depths,
             "concurrencies": concurrencies,
+            "sessions": args.sessions,
             "user_size_bytes": args.user_size,
             "assistant_size_bytes": args.assistant_size,
             "warmup": args.warmup,
@@ -1135,6 +1215,31 @@ def parse_args() -> argparse.Namespace:
             "Comma-separated list of concurrency levels. For each value C, C "
             "parallel asyncio tasks each drive their own session through the "
             "same Aerospike client. Default: 1 (single session)."
+        ),
+    )
+    parser.add_argument(
+        "--sessions",
+        type=int,
+        default=None,
+        help=(
+            "Number of distinct session_ids to fan tasks across. Default "
+            "(None) gives every task its own session (the realistic agent "
+            "concurrency shape). Set to 1 to force every task onto one "
+            "record (pathological hot-key stress test). Set to a value "
+            "between 1 and --concurrency to study partial contention."
+        ),
+    )
+    parser.add_argument(
+        "--max-worker-threads",
+        type=int,
+        default=None,
+        help=(
+            "Size of asyncio's default ThreadPoolExecutor, which the "
+            "sync Aerospike client dispatches into via asyncio.to_thread. "
+            "Python's default is min(32, cpu+4) = ~12 on an 8-vCPU box, "
+            "which silently caps concurrent C-client calls regardless of "
+            "--concurrency. Default here: max(64, 4 * max concurrency). "
+            "Raise this if you see throughput plateau but server CPU idle."
         ),
     )
     parser.add_argument(

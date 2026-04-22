@@ -55,8 +55,11 @@ while [ $# -gt 0 ]; do
 done
 
 case "$TOPOLOGY" in
-  single-node|three-node) :;;
-  *) echo "topology must be single-node or three-node (got: $TOPOLOGY)" >&2; exit 2;;
+  # aerolab-compare is a read-only topology: it provisions only a client VM
+  # and points it at an externally-managed (aerolab-built) Aerospike cluster.
+  # It therefore only supports the aerospike/aerospike-sharded backends.
+  single-node|three-node|aerolab-compare) :;;
+  *) echo "topology must be single-node, three-node, or aerolab-compare (got: $TOPOLOGY)" >&2; exit 2;;
 esac
 
 case "$PASS" in
@@ -130,11 +133,17 @@ TF_OUT="/tmp/tf-out.$$.json"
 
 CLIENT_NAME=$(jq -r '.client_name.value' "$TF_OUT")
 AS_SEED=$(jq -r '.aerospike_seed_ip.value' "$TF_OUT")
-REDIS_URL=$(jq -r '.redis_url.value' "$TF_OUT")
-SQLA_URL=$(jq -r '.sqlalchemy_url.value' "$TF_OUT")
+REDIS_URL=$(jq -r '.redis_url.value // empty' "$TF_OUT")
+SQLA_URL=$(jq -r '.sqlalchemy_url.value // empty' "$TF_OUT")
 TOPO_OUT=$(jq -r '.topology.value' "$TF_OUT")
 ZONE=$(jq -r '.zone.value // empty' "$TF_OUT")
 [ -z "$ZONE" ] && ZONE="us-central1-a"
+
+# Namespace is always 'bench' for our own terraform, but the aerolab-compare
+# topology points at an external cluster whose namespace we don't control
+# (aerolab's default is 'test'). Pick it up from terraform output if present.
+AS_NAMESPACE=$(jq -r '.aerospike_namespace.value // empty' "$TF_OUT")
+[ -z "$AS_NAMESPACE" ] && AS_NAMESPACE="bench"
 
 if [ -z "$CLIENT_NAME" ] || [ "$CLIENT_NAME" = "null" ]; then
   echo "[orch] terraform hasn't been applied (no client_name output). Run 'terraform apply' in ${TF_DIR} first." >&2
@@ -148,9 +157,23 @@ fi
 
 echo "[orch] topology=${TOPOLOGY} zone=${ZONE}"
 echo "[orch] client=${CLIENT_NAME}"
-echo "[orch] aerospike_seed=${AS_SEED}"
-echo "[orch] redis_url=${REDIS_URL}"
-echo "[orch] sqlalchemy_url=<redacted>"
+echo "[orch] aerospike_seed=${AS_SEED} namespace=${AS_NAMESPACE}"
+[ -n "$REDIS_URL" ] && echo "[orch] redis_url=${REDIS_URL}"
+[ -n "$SQLA_URL" ]  && echo "[orch] sqlalchemy_url=<redacted>"
+
+# aerolab-compare only serves the aerospike/aerospike-sharded backends. Trim
+# the backend list so we don't SSH in and immediately fail on a missing
+# REDIS_URL or SQLALCHEMY_URL.
+if [ "$TOPOLOGY" = "aerolab-compare" ]; then
+  TRIMMED=""
+  for b in $BACKENDS; do
+    case "$b" in
+      aerospike|aerospike-sharded) TRIMMED="${TRIMMED} $b";;
+      *) echo "[orch] skipping ${b}: aerolab-compare only supports aerospike backends";;
+    esac
+  done
+  BACKENDS="${TRIMMED# }"
+fi
 
 # --- results dir -------------------------------------------------------
 
@@ -172,10 +195,10 @@ run_backend() {
   local env_prefix=""
   case "$backend" in
     aerospike|aerospike-sharded)
-      # Namespace must match the one the terraform module configured.
-      # The module default is 'bench' (see modules/aerospike-cluster/variables.tf);
-      # if a topology ever overrides it, plumb through terraform output.
-      env_prefix="AEROSPIKE_HOST='${AS_SEED}' AEROSPIKE_PORT=3000 AEROSPIKE_NAMESPACE=bench"
+      # Namespace is topology-dependent: our own terraform modules configure
+      # 'bench'; aerolab-compare points at an external cluster (aerolab default
+      # 'test'). Plumbed through terraform output `aerospike_namespace`.
+      env_prefix="AEROSPIKE_HOST='${AS_SEED}' AEROSPIKE_PORT=3000 AEROSPIKE_NAMESPACE='${AS_NAMESPACE}'"
       ;;
     redis)
       env_prefix="REDIS_URL='${REDIS_URL}'"
