@@ -119,9 +119,7 @@ def _render_markdown(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> st
     out.append("")
 
     # Sort rows: by depth asc, concurrency asc, then backend.
-    rows_sorted = sorted(
-        rows, key=lambda r: (r["depth"] or 0, r["concurrency"] or 0, r["backend"])
-    )
+    rows_sorted = sorted(rows, key=lambda r: (r["depth"] or 0, r["concurrency"] or 0, r["backend"]))
 
     out.append("## Turn latency (ms) — lower is better")
     out.append("")
@@ -129,7 +127,7 @@ def _render_markdown(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> st
     out.append("|------:|------------:|:--------|----:|----:|----:|-----:|--------:|")
     for r in rows_sorted:
         tps = r["tps"]
-        tps_str = f"{tps:,.0f}" if isinstance(tps, (int, float)) else "—"
+        tps_str = f"{tps:,.0f}" if isinstance(tps, int | float) else "—"
         out.append(
             f"| {r['depth']} | {r['concurrency']} | `{r['backend']}` | "
             f"{_fmt_ms(r['p50_ms'])} | {_fmt_ms(r['p95_ms'])} | "
@@ -148,7 +146,9 @@ def _render_markdown(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> st
         if v is None or (isinstance(v, float) and v != v):
             continue
         buckets.setdefault((r["depth"], r["concurrency"]), []).append(r)
-    for (depth, conc), group in sorted(buckets.items(), key=lambda kv: (kv[0][0] or 0, kv[0][1] or 0)):
+    for (depth, conc), group in sorted(
+        buckets.items(), key=lambda kv: (kv[0][0] or 0, kv[0][1] or 0)
+    ):
         ranked = sorted(group, key=lambda r: r["p50_ms"])
         winner = ranked[0]
         runner = ranked[1] if len(ranked) > 1 else None
