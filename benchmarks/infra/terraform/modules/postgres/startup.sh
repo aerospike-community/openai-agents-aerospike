@@ -69,10 +69,14 @@ apt-get install -y "postgresql-${PG_MAJOR}"
 # Stop and wipe the default cluster that postgresql-common created.
 pg_dropcluster --stop "${PG_MAJOR}" main || true
 
-PG_DATA_DIR="/var/lib/postgresql/${PG_MAJOR}/main"
+# The NVMe is mounted at PG_MOUNT; the actual data dir is a
+# subdirectory under it. initdb refuses to run in an ext4 mount root
+# because of the inevitable lost+found directory there.
+PG_MOUNT="/var/lib/postgresql/${PG_MAJOR}/mnt"
+PG_DATA_DIR="${PG_MOUNT}/main"
 PG_CONF_DIR="/etc/postgresql/${PG_MAJOR}/main"
-mkdir -p "${PG_DATA_DIR}"
-chown postgres:postgres "${PG_DATA_DIR}"
+mkdir -p "${PG_MOUNT}"
+chown postgres:postgres "${PG_MOUNT}"
 
 # --- Format & mount local NVMe on the data dir -------------------------
 
@@ -82,11 +86,12 @@ if [ -b "${NVME_DEV}" ]; then
     log "Formatting ${NVME_DEV} as ext4"
     mkfs.ext4 -F -L pg-data "${NVME_DEV}"
   fi
-  mount -o noatime "${NVME_DEV}" "${PG_DATA_DIR}"
-  echo "LABEL=pg-data ${PG_DATA_DIR} ext4 noatime 0 0" >> /etc/fstab
-  chown -R postgres:postgres "${PG_DATA_DIR}"
-  chmod 700 "${PG_DATA_DIR}"
+  mount -o noatime "${NVME_DEV}" "${PG_MOUNT}"
+  echo "LABEL=pg-data ${PG_MOUNT} ext4 noatime 0 0" >> /etc/fstab
 fi
+mkdir -p "${PG_DATA_DIR}"
+chown -R postgres:postgres "${PG_MOUNT}"
+chmod 700 "${PG_DATA_DIR}"
 
 # --- Initialize this node based on role -------------------------------
 
@@ -150,12 +155,22 @@ CONF
 case "${NODE_ROLE}" in
   standalone|primary)
     log "Initializing primary at ${PG_DATA_DIR}"
+    # bash process substitution (--pwfile=<(echo ...)) fails under sudo:
+    # /dev/fd/63 is owned by the invoking uid, and postgres can't read
+    # it. Write the password as root first, then hand the file off to
+    # postgres; this order avoids any issue with writing to a file we
+    # no longer own.
+    PWFILE="/tmp/pgpw.$$"
+    printf '%s' "${PG_PASSWORD}" > "${PWFILE}"
+    chown postgres:postgres "${PWFILE}"
+    chmod 600 "${PWFILE}"
     sudo -u postgres /usr/lib/postgresql/${PG_MAJOR}/bin/initdb \
       --auth-host=scram-sha-256 \
       --auth-local=peer \
       --username=postgres \
-      --pwfile=<(echo "${PG_PASSWORD}") \
+      --pwfile="${PWFILE}" \
       -D "${PG_DATA_DIR}"
+    rm -f "${PWFILE}"
 
     write_postgresql_conf
     write_pg_hba

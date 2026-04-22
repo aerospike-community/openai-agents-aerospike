@@ -172,7 +172,10 @@ run_backend() {
   local env_prefix=""
   case "$backend" in
     aerospike|aerospike-sharded)
-      env_prefix="AEROSPIKE_HOST='${AS_SEED}' AEROSPIKE_PORT=3000"
+      # Namespace must match the one the terraform module configured.
+      # The module default is 'bench' (see modules/aerospike-cluster/variables.tf);
+      # if a topology ever overrides it, plumb through terraform output.
+      env_prefix="AEROSPIKE_HOST='${AS_SEED}' AEROSPIKE_PORT=3000 AEROSPIKE_NAMESPACE=bench"
       ;;
     redis)
       env_prefix="REDIS_URL='${REDIS_URL}'"
@@ -200,21 +203,17 @@ run_backend() {
     extra_flags="--sqlalchemy-pool-size=${max_conc}"
   fi
 
-  local remote_cmd
-  remote_cmd=$(cat <<REMOTE
-set -euo pipefail
-cd \$HOME/aerospike-openai-agents
-. .venv/bin/activate
-${env_prefix} python benchmarks/session_latency.py \\
-  --backend=${backend} \\
-  --concurrency='${CONCURRENCY}' \\
-  --history-depth='${DEPTHS}' \\
-  --iterations=${ITERS} \\
-  --warmup=${WARMUP} \\
-  --output='${remote_out}' \\
-  ${extra_flags}
-REMOTE
-)
+  # The client's startup script clones + sets up the venv under the
+  # uid=1000 user (usually 'ubuntu' on GCP Ubuntu images). Our SSH
+  # user may be different (GCP auto-provisions a per-invoker account),
+  # so run the harness explicitly as 'ubuntu' via sudo. Absolute
+  # paths only; no $HOME games.
+  # One long single-line command avoids line-continuation pitfalls when
+  # the string is marshalled through gcloud/ssh/bash-c. Keep the quoting
+  # simple: single-quote the inner bash -c body, let ${env_prefix} and
+  # flags interpolate at outer script time.
+  local inner_cmd="cd /home/ubuntu/aerospike-openai-agents && . .venv/bin/activate && ${env_prefix} python benchmarks/session_latency.py --backend=${backend} --concurrency=${CONCURRENCY} --history-depth=${DEPTHS} --iterations=${ITERS} --warmup=${WARMUP} --output=${remote_out} ${extra_flags}"
+  local remote_cmd="sudo -u ubuntu bash -c \"${inner_cmd}\""
 
   echo ""
   echo "[orch] === backend: ${backend} ==="

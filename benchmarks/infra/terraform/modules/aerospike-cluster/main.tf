@@ -39,6 +39,7 @@ resource "google_compute_instance" "node" {
     node-index                = count.index
     cluster-size              = var.node_count
     aerospike-version         = var.server_version
+    aerospike-tools-version   = var.tools_version
     aerospike-namespace       = var.namespace
     replication-factor        = local.effective_replication_factor
     local-ssd-count           = var.local_ssd_count
