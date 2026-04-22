@@ -26,9 +26,9 @@ variable "aerospike_features_conf_path" {
 }
 
 variable "aerospike_server_version" {
-  description = "Aerospike Enterprise server version."
+  description = "Aerospike Enterprise server version. 8.0 is the current GA line."
   type        = string
-  default     = "7.2.0.3"
+  default     = "8.0.0.15"
 }
 
 variable "name_prefix" {

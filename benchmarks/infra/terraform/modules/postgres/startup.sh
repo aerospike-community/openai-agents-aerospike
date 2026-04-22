@@ -77,6 +77,10 @@ PG_DATA_DIR="${PG_MOUNT}/main"
 PG_CONF_DIR="/etc/postgresql/${PG_MAJOR}/main"
 mkdir -p "${PG_MOUNT}"
 chown postgres:postgres "${PG_MOUNT}"
+# pg_dropcluster removes /etc/postgresql/$PG_MAJOR/main; recreate it so
+# write_postgresql_conf / write_pg_hba have somewhere to write.
+mkdir -p "${PG_CONF_DIR}"
+chown postgres:postgres "${PG_CONF_DIR}"
 
 # --- Format & mount local NVMe on the data dir -------------------------
 

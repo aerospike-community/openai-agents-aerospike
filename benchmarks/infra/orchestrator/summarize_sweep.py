@@ -85,11 +85,18 @@ def _extract_rows(backend: str, blob: dict[str, Any]) -> list[dict[str, Any]]:
                 "backend": backend,
                 "depth": v.get("history_depth_before_bench"),
                 "concurrency": v.get("concurrency"),
+                # sessions and tasks_per_session were added to the harness
+                # output in the multi-session-fanout change; older result
+                # blobs won't have them, so fall back to concurrency (one
+                # session per task, which was the prior implicit default).
+                "sessions": v.get("sessions", v.get("concurrency")),
                 "p50_ms": turn.get("p50_ms"),
                 "p95_ms": turn.get("p95_ms"),
                 "p99_ms": turn.get("p99_ms"),
                 "mean_ms": turn.get("mean_ms"),
                 "tps": v.get("throughput_turns_per_second"),
+                "retries": v.get("overload_retries", 0),
+                "rotations": v.get("rotations", 0),
             }
         )
     return rows
@@ -123,15 +130,31 @@ def _render_markdown(manifest: dict[str, Any], rows: list[dict[str, Any]]) -> st
 
     out.append("## Turn latency (ms) — lower is better")
     out.append("")
-    out.append("| depth | concurrency | backend | p50 | p95 | p99 | mean | turns/s |")
-    out.append("|------:|------------:|:--------|----:|----:|----:|-----:|--------:|")
+    out.append(
+        "`retries` = backend-declared overload responses the harness absorbed "
+        "with backoff. Nonzero values mean the cluster is at or past its "
+        "sustainable write rate for that variant."
+    )
+    out.append("")
+    out.append(
+        "| depth | C | sessions | backend | p50 | p95 | p99 | mean | turns/s | retries |"
+    )
+    out.append(
+        "|------:|--:|---------:|:--------|----:|----:|----:|-----:|--------:|--------:|"
+    )
     for r in rows_sorted:
         tps = r["tps"]
         tps_str = f"{tps:,.0f}" if isinstance(tps, int | float) else "—"
+        retries = r["retries"] or 0
+        retries_str = f"{retries:,}" if retries else "0"
+        sessions = r["sessions"]
+        sessions_str = str(sessions) if sessions is not None else "—"
         out.append(
-            f"| {r['depth']} | {r['concurrency']} | `{r['backend']}` | "
+            f"| {r['depth']} | {r['concurrency']} | {sessions_str} | "
+            f"`{r['backend']}` | "
             f"{_fmt_ms(r['p50_ms'])} | {_fmt_ms(r['p95_ms'])} | "
-            f"{_fmt_ms(r['p99_ms'])} | {_fmt_ms(r['mean_ms'])} | {tps_str} |"
+            f"{_fmt_ms(r['p99_ms'])} | {_fmt_ms(r['mean_ms'])} | "
+            f"{tps_str} | {retries_str} |"
         )
     out.append("")
 
