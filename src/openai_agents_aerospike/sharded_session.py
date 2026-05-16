@@ -37,7 +37,6 @@ this is not observable.
 
 from __future__ import annotations
 
-import asyncio
 import json
 from typing import Any
 
@@ -218,7 +217,7 @@ class ShardedAerospikeSession(AerospikeSession):
             return []
 
         async with self._lock:
-            raw_messages = await asyncio.to_thread(self._get_items_sharded_sync, session_limit)
+            raw_messages = await self._run_client_io(self._get_items_sharded_sync, session_limit)
 
         items: list[TResponseInputItem] = []
         for raw in raw_messages:
@@ -394,7 +393,7 @@ class ShardedAerospikeSession(AerospikeSession):
                         raise
 
         async with self._lock:
-            await asyncio.to_thread(_op)
+            await self._run_client_io(_op)
 
     # ------------------------------------------------------------------
     # Introspection
@@ -402,7 +401,7 @@ class ShardedAerospikeSession(AerospikeSession):
 
     async def active_shard(self) -> int:
         """Return the current active-shard number (0 means single-record)."""
-        return await asyncio.to_thread(self._read_active_shard)
+        return await self._run_client_io(self._read_active_shard)
 
 
 __all__ = ["ShardedAerospikeSession"]

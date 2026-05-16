@@ -9,6 +9,8 @@ Aerospike server (see ``conftest.py``).
 from __future__ import annotations
 
 import asyncio
+import threading
+import time
 
 import pytest
 from agents import TResponseInputItem
@@ -18,6 +20,28 @@ from openai_agents_aerospike import AerospikeSession, SessionRecordTooLargeError
 from .conftest import make_session
 
 pytestmark = pytest.mark.asyncio
+
+
+class _BlockingFakeClient:
+    """Fake Aerospike client that records overlapping ``operate`` calls."""
+
+    def __init__(self) -> None:
+        self.calls = 0
+        self.max_active_calls = 0
+        self._active_calls = 0
+        self._lock = threading.Lock()
+
+    def operate(self, *_args: object, **_kwargs: object) -> tuple[None, None, dict[str, object]]:
+        with self._lock:
+            self.calls += 1
+            self._active_calls += 1
+            self.max_active_calls = max(self.max_active_calls, self._active_calls)
+        try:
+            time.sleep(0.02)
+            return None, None, {}
+        finally:
+            with self._lock:
+                self._active_calls -= 1
 
 
 async def test_add_and_get(aerospike_session: AerospikeSession) -> None:
@@ -153,6 +177,25 @@ async def test_concurrent_adds_preserve_all_items(aerospike_session: AerospikeSe
     retrieved = await aerospike_session.get_items()
     contents = {i.get("content") for i in retrieved}
     assert contents == {f"msg-{i}" for i in range(15)}
+
+
+async def test_shared_client_calls_are_serialized_across_sessions() -> None:
+    """Concurrent sessions sharing one sync client must not enter it concurrently."""
+    client = _BlockingFakeClient()
+    sessions = [
+        AerospikeSession(session_id=f"shared-client-{i}", client=client)  # type: ignore[arg-type]
+        for i in range(8)
+    ]
+
+    await asyncio.gather(
+        *(
+            session.add_items([{"role": "user", "content": str(i)}])
+            for i, session in enumerate(sessions)
+        )
+    )
+
+    assert client.calls == len(sessions)
+    assert client.max_active_calls == 1
 
 
 async def test_get_next_id_is_monotonic(aerospike_session: AerospikeSession) -> None:

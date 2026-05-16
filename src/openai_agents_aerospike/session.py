@@ -27,8 +27,10 @@ from __future__ import annotations
 
 import asyncio
 import json
+import threading
 import time
-from typing import TYPE_CHECKING, Any
+from collections.abc import Callable
+from typing import TYPE_CHECKING, Any, ParamSpec, TypeVar
 
 try:
     import aerospike
@@ -57,6 +59,22 @@ _BIN_MESSAGES = "messages"
 # AEROSPIKE_ERR_RECORD_TOO_BIG, returned when a write would exceed the
 # namespace's configured write-block-size (default 1 MiB).
 _ERR_RECORD_TOO_BIG = 13
+_CLIENT_LOCKS: dict[int, threading.RLock] = {}
+_CLIENT_LOCKS_GUARD = threading.Lock()
+
+P = ParamSpec("P")
+R = TypeVar("R")
+
+
+def _client_lock(client: AerospikeClient) -> threading.RLock:
+    """Return the in-process call gate for a shared Aerospike client."""
+    client_id = id(client)
+    with _CLIENT_LOCKS_GUARD:
+        lock = _CLIENT_LOCKS.get(client_id)
+        if lock is None:
+            lock = threading.RLock()
+            _CLIENT_LOCKS[client_id] = lock
+        return lock
 
 
 class SessionRecordTooLargeError(Exception):
@@ -252,6 +270,15 @@ class AerospikeSession(SessionABC):
             return {}
         return {"ttl": self._ttl}
 
+    async def _run_client_io(self, func: Callable[P, R], *args: P.args, **kwargs: P.kwargs) -> R:
+        """Run blocking Aerospike client work behind this client's call gate."""
+
+        def _guarded() -> R:
+            with _client_lock(self._client):
+                return func(*args, **kwargs)
+
+        return await asyncio.to_thread(_guarded)
+
     def _handle_missing_record(self, exc: BaseException) -> bool:
         """Return True if ``exc`` is Aerospike's record-not-found error."""
         # RecordNotFound is canonical; older clients may raise plain
@@ -281,7 +308,7 @@ class AerospikeSession(SessionABC):
             value = bins.get(_BIN_COUNTER)
             return int(value) if value is not None else 0
 
-        return await asyncio.to_thread(_op)
+        return await self._run_client_io(_op)
 
     # ------------------------------------------------------------------
     # Session protocol implementation
@@ -303,7 +330,7 @@ class AerospikeSession(SessionABC):
             return []
 
         async with self._lock:
-            raw_messages = await asyncio.to_thread(self._get_items_sync, session_limit)
+            raw_messages = await self._run_client_io(self._get_items_sync, session_limit)
 
         items: list[TResponseInputItem] = []
         for raw in raw_messages:
@@ -360,7 +387,7 @@ class AerospikeSession(SessionABC):
         now = int(time.time())
 
         async with self._lock:
-            await asyncio.to_thread(self._add_items_sync, serialized, now)
+            await self._run_client_io(self._add_items_sync, serialized, now)
 
     def _add_items_sync(self, serialized: list[str], now: int) -> None:
         """Blocking half of :meth:`add_items`."""
@@ -395,7 +422,7 @@ class AerospikeSession(SessionABC):
         Returns ``None`` if the session is empty or the record does not exist.
         """
         async with self._lock:
-            raw = await asyncio.to_thread(self._pop_item_sync)
+            raw = await self._run_client_io(self._pop_item_sync)
 
         if raw is None:
             return None
@@ -443,7 +470,7 @@ class AerospikeSession(SessionABC):
                 raise
 
         async with self._lock:
-            await asyncio.to_thread(_op)
+            await self._run_client_io(_op)
 
     # ------------------------------------------------------------------
     # Lifecycle helpers
@@ -457,7 +484,7 @@ class AerospikeSession(SessionABC):
         untouched; the caller remains responsible for the client's lifecycle.
         """
         if self._owns_client:
-            await asyncio.to_thread(self._client.close)
+            await self._run_client_io(self._client.close)
 
     async def ping(self) -> bool:
         """Test connectivity to the Aerospike cluster.
@@ -477,4 +504,4 @@ class AerospikeSession(SessionABC):
             except Exception:  # noqa: BLE001
                 return False
 
-        return await asyncio.to_thread(_op)
+        return await self._run_client_io(_op)
